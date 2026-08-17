@@ -1,0 +1,607 @@
+/*
+ * Reproducible builds (AMO source review): Tailwind v4's automatic content
+ * detection walks the whole project and only skips what `.gitignore` lists.
+ * That made the emitted CSS depend on whether a *previous* build was still
+ * lying around: `build:chrome && build:firefox` scanned
+ * `.output/chrome-mv3/chunks/popup-*.js` and harvested `border-collapse` and
+ * `resize` out of qrcode-generator's inlined `createTableTag()` markup, so the
+ * same source tree produced two different CSS assets (and, because the CSS
+ * hash feeds the chunk hash, two different JS filenames for byte-identical JS).
+ *
+ * `source(none)` turns the automatic detection off; the two `@source` rules
+ * below are the complete, explicit content list. `.output/` and `.wxt/` are
+ * gitignored as well, but a reviewer who unpacks the sources zip never sees a
+ * dotfile; the guarantee has to live in a file they actually read.
+ */
+@import 'tailwindcss' source(none);
+@source '../../src';
+@source '../../entrypoints';
+
+/**
+ * Design tokens from brand/tokens.json (ARCHITECTURE.md §7), identical to the
+ * website's palette in website/src/styles/global.css; one brand, one palette.
+ * Light mode is mandatory via prefers-color-scheme; contrast is WCAG AA.
+ *
+ * The palette follows the website's two-role split:
+ *   --sw-accent    the aubergine FILL (buttons, discs). Theme-dependent: the
+ *                  vivid value only reaches AA against dark text, so light
+ *                  mode fills with the deeper aubergine and writes white on it
+ *                  (--sw-on-accent is the matching label colour).
+ *   --sw-*-fg      FOREGROUND variants that hold WCAG AA as text against the
+ *                  current bg/surface, what `text-accent-fg` etc. render.
+ *   --sw-ice       the second brand colour. Never a call to action: ice marks
+ *                  calm, factual things, so aubergine stays the only colour
+ *                  that means "click me".
+ */
+:root {
+  /* Plum-tinted near-black, not blue-black: the neutrals carry a trace of the
+     accent hue so aubergine reads as the UI's own colour. */
+  --sw-bg: #0c0910;
+  --sw-surface: #17111e;
+  --sw-surface2: #211829;
+  --sw-border: #2e2338;
+  --sw-text: #f1ecf5;
+  --sw-muted: #a99bb5;
+  --sw-accent: #a855f7;
+  --sw-on-accent: #12060f;
+  --sw-accent-fg: #c77dff;
+  --sw-ice: #9be7d2;
+  --sw-ice-fg: #7fd9c0;
+  --sw-success: #2ed3a0;
+  --sw-warn: #ffb020;
+  --sw-danger: #ff5c5c;
+  --sw-success-fg: #2ed3a0;
+  --sw-warn-fg: #ffb020;
+  --sw-danger-fg: #ff6b6b;
+  --sw-radius: 12px;
+  --sw-radius-lg: 16px;
+  /* Fixed dock height (one icon+label row); the header height is measured at
+     runtime instead (badges can wrap to a second row) and lands in
+     --sw-header-h on the popup root, see Frame in App.tsx. */
+  --sw-nav-h: 58px;
+  /* Motion tokens (redesign v1.1). Guarded by prefers-reduced-motion below. */
+  --sw-motion-fast: 150ms;
+  --sw-motion-base: 250ms;
+  color-scheme: dark light;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --sw-bg: #ffffff;
+    --sw-surface: #f8f5fb;
+    --sw-surface2: #f0eaf5;
+    --sw-border: #e4dcec;
+    --sw-text: #17111e;
+    --sw-muted: #665a72;
+    --sw-accent: #7b2fb8;
+    --sw-on-accent: #ffffff;
+    /* Darkened foregrounds: >= 4.5:1 on white and on #F8F5FB. */
+    --sw-accent-fg: #7a1fb0;
+    --sw-ice-fg: #0b6b58;
+    --sw-success-fg: #0a6e52;
+    --sw-warn-fg: #7a4b00;
+    --sw-danger-fg: #b32020;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --sw-motion-fast: 0ms;
+    --sw-motion-base: 0ms;
+  }
+}
+
+/* Expose the tokens to Tailwind v4 as first-class theme values. */
+@theme inline {
+  --color-bg: var(--sw-bg);
+  --color-surface: var(--sw-surface);
+  --color-border: var(--sw-border);
+  --color-text: var(--sw-text);
+  --color-muted: var(--sw-muted);
+  --color-accent: var(--sw-accent);
+  --color-on-accent: var(--sw-on-accent);
+  --color-accent-fg: var(--sw-accent-fg);
+  --color-ice: var(--sw-ice);
+  --color-ice-fg: var(--sw-ice-fg);
+  --color-success: var(--sw-success);
+  --color-warn: var(--sw-warn);
+  --color-danger: var(--sw-danger);
+  --color-success-fg: var(--sw-success-fg);
+  --color-warn-fg: var(--sw-warn-fg);
+  --color-danger-fg: var(--sw-danger-fg);
+  --color-surface2: var(--sw-surface2);
+  --radius-token: var(--sw-radius);
+  --radius-token-lg: var(--sw-radius-lg);
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+/*
+ * Inter is self-hosted as WOFF2 and shipped inside the extension package, no
+ * Google Fonts CDN (GDPR, §7) and no remote request at all (invariants 3 & 4).
+ * The files are copied from @fontsource-variable/inter into public/fonts/.
+ */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/fonts/inter-variable.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/fonts/inter-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+    U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  width: 360px;
+  height: 600px;
+  overflow: hidden;
+  background-color: var(--sw-bg);
+  color: var(--sw-text);
+  font-family: var(--font-sans, sans-serif);
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  width: 360px;
+  height: 600px;
+}
+
+/*
+ * Success check (redesign v1.1): circle + mark draw themselves in. Under
+ * prefers-reduced-motion the animation collapses to the final frame.
+ */
+.sw-check {
+  width: 92px;
+  height: 92px;
+}
+.sw-check .c {
+  stroke: var(--sw-success);
+  stroke-width: 2.5;
+  fill: color-mix(in srgb, var(--sw-success) 8%, transparent);
+  stroke-dasharray: 290;
+  stroke-dashoffset: 290;
+  animation: sw-draw 0.7s ease forwards;
+}
+.sw-check .m {
+  stroke: var(--sw-success);
+  stroke-width: 3.5;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-dasharray: 60;
+  stroke-dashoffset: 60;
+  animation: sw-draw 0.45s ease 0.5s forwards;
+}
+@keyframes sw-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sw-check .c,
+  .sw-check .m {
+    animation-duration: 0.01ms;
+    animation-delay: 0ms;
+  }
+}
+
+/* Wrong word chip in the onboarding quiz (redesign v1.1). */
+.sw-shake {
+  animation: sw-shake 0.35s;
+}
+@keyframes sw-shake {
+  25% {
+    transform: translateX(-3px);
+  }
+  50% {
+    transform: translateX(3px);
+  }
+  75% {
+    transform: translateX(-2px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sw-shake {
+    animation: none;
+  }
+}
+
+/*
+ * Global micro-interactions (redesign v1.1, P2). Transform-only so nothing
+ * reflows; both collapse to no-ops under prefers-reduced-motion.
+ */
+.sw-press {
+  transition: transform var(--sw-motion-fast) ease;
+}
+.sw-press:active:not(:disabled) {
+  transform: scale(0.97);
+}
+.sw-lift {
+  transition:
+    transform var(--sw-motion-fast) ease,
+    background-color var(--sw-motion-fast) ease,
+    border-color var(--sw-motion-fast) ease,
+    box-shadow var(--sw-motion-fast) ease;
+}
+.sw-lift:hover {
+  transform: translateY(-2px);
+  /* Website's sw-lift: the row lifts toward an accent-tinted light, so hover
+     reads as "lit by the brand colour" instead of a plain grey elevation. */
+  border-color: color-mix(in oklab, var(--sw-accent) 45%, var(--sw-border));
+  box-shadow: 0 10px 24px -14px color-mix(in oklab, var(--sw-accent) 70%, transparent);
+}
+@media (prefers-reduced-motion: reduce) {
+  .sw-press:active:not(:disabled),
+  .sw-lift:hover {
+    transform: none;
+  }
+}
+
+/*
+ * Bottom sheet (redesign v1.1, P3): backdrop fades, panel slides up.
+ * Final frame immediately under prefers-reduced-motion.
+ */
+.sw-sheet-backdrop {
+  animation: sw-fade-in 0.2s ease both;
+}
+.sw-sheet-panel {
+  animation: sw-slide-up 0.28s cubic-bezier(0.32, 0.72, 0.24, 1) both;
+}
+@keyframes sw-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes sw-slide-up {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sw-sheet-backdrop,
+  .sw-sheet-panel {
+    animation: none;
+  }
+}
+
+/* QR hero entrance (P2 "Receive"): one soft pop, final frame under reduced motion. */
+.sw-pop {
+  animation: sw-pop 0.3s cubic-bezier(0.34, 1.4, 0.64, 1) both;
+}
+@keyframes sw-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sw-pop {
+    animation: none;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--sw-border);
+  border-radius: 3px;
+}
+
+::selection {
+  background: var(--sw-accent);
+  color: var(--sw-on-accent);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Surface treatments: the "icy" half of the brand, ported from the website
+ * (website/src/styles/global.css). Plain classes, not @utility: they follow
+ * the existing sw-* pattern in this file.
+ * ---------------------------------------------------------------------------
+ */
+
+/* Frosted panel. The border is mixed from the accent so the frost warms toward
+   aubergine instead of being a neutral grey sheet. Used by the bottom sheet,
+   where real content scrolls behind the blur. */
+.sw-glass {
+  background: color-mix(in oklab, var(--sw-bg) 55%, transparent);
+  backdrop-filter: blur(14px) saturate(1.35);
+  -webkit-backdrop-filter: blur(14px) saturate(1.35);
+  border-color: color-mix(in oklab, var(--sw-border) 88%, var(--sw-accent));
+}
+/* No blur support → solid panel, so text never sits on see-through chrome. */
+@supports not ((backdrop-filter: blur(14px)) or (-webkit-backdrop-filter: blur(14px))) {
+  .sw-glass,
+  .sw-header,
+  .sw-dock {
+    background: color-mix(in oklab, var(--sw-bg) 78%, var(--sw-surface));
+  }
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Overlay chrome (redesign v1.2): header and tab dock float ON TOP of the
+ * screens as frosted glass, and the screens scroll UNDER them. The screens'
+ * scroll containers span the full popup height; these two rules push their
+ * *content* below/above the bars, so scrolled content is visible through the
+ * frost. Applied to the wrappers in App.tsx (`> *` = the screen root, which
+ * is also the scroll container, padding must live inside it).
+ */
+.sw-under-header > * {
+  padding-top: calc(var(--sw-header-h, 46px) + 10px);
+}
+.sw-above-nav > * {
+  padding-bottom: calc(var(--sw-nav-h) + 14px);
+}
+
+/* The frosted header bar. Grows a shadow once content actually scrolls under
+   it (data-scrolled, set from a capture-phase scroll listener in App.tsx). */
+.sw-header {
+  background: color-mix(in oklab, var(--sw-bg) 62%, transparent);
+  backdrop-filter: blur(14px) saturate(1.35);
+  -webkit-backdrop-filter: blur(14px) saturate(1.35);
+  border-bottom: 1px solid color-mix(in oklab, var(--sw-border) 65%, transparent);
+  transition:
+    border-color var(--sw-motion-base) ease,
+    box-shadow var(--sw-motion-base) ease;
+}
+.sw-header[data-scrolled='true'] {
+  border-bottom-color: color-mix(in oklab, var(--sw-accent) 22%, var(--sw-border));
+  box-shadow: 0 12px 28px -18px rgb(0 0 0 / 0.55);
+}
+
+/* The floating tab dock: a frosted pill above the content. */
+.sw-dock {
+  background: color-mix(in oklab, var(--sw-bg) 58%, transparent);
+  backdrop-filter: blur(14px) saturate(1.35);
+  -webkit-backdrop-filter: blur(14px) saturate(1.35);
+  border-color: color-mix(in oklab, var(--sw-border) 86%, var(--sw-accent));
+  box-shadow: 0 12px 32px -14px rgb(0 0 0 / 0.55);
+}
+@media (prefers-color-scheme: light) {
+  .sw-header[data-scrolled='true'] {
+    box-shadow: 0 12px 28px -18px rgb(23 17 30 / 0.28);
+  }
+  .sw-dock {
+    box-shadow: 0 12px 32px -16px rgb(23 17 30 / 0.3);
+  }
+}
+
+/*
+ * The balance hero as a wallet card (redesign v1.2), quoting the 3D renders:
+ * aubergine body lit from above, an icy sheen in the corner, and the leather
+ * wallet's stitched seam as a dashed inset line (::after, ::before belongs
+ * to sw-edge-light, which this card also wears).
+ */
+.sw-wallet-card {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid color-mix(in oklab, var(--sw-accent) 32%, var(--sw-border));
+  background:
+    radial-gradient(
+      130% 110% at 88% -10%,
+      color-mix(in oklab, var(--sw-ice) 10%, transparent),
+      transparent 55%
+    ),
+    radial-gradient(
+      150% 120% at 12% -25%,
+      color-mix(in oklab, var(--sw-accent) 24%, transparent),
+      transparent 62%
+    ),
+    linear-gradient(
+      165deg,
+      color-mix(in oklab, var(--sw-accent) 12%, var(--sw-surface)),
+      var(--sw-surface) 72%
+    );
+  box-shadow: 0 18px 40px -24px color-mix(in oklab, var(--sw-accent) 60%, transparent);
+}
+.sw-wallet-card::after {
+  content: '';
+  position: absolute;
+  inset: 6px;
+  border-radius: calc(var(--sw-radius-lg) - 5px);
+  border: 1.5px dashed color-mix(in oklab, var(--sw-ice) 42%, transparent);
+  opacity: 0.55;
+  pointer-events: none;
+}
+@media (prefers-color-scheme: light) {
+  .sw-wallet-card {
+    box-shadow: 0 16px 32px -24px color-mix(in oklab, var(--sw-accent) 45%, transparent);
+  }
+  .sw-wallet-card::after {
+    border-color: color-mix(in oklab, var(--sw-ice-fg) 35%, transparent);
+    opacity: 0.4;
+  }
+}
+
+/* Idle float for the 3D props; the website's sw-float at popup scale.
+   Time-based and gentle; completely off under prefers-reduced-motion. */
+@media (prefers-reduced-motion: no-preference) {
+  .sw-float {
+    animation: sw-float 6s ease-in-out infinite alternate;
+  }
+}
+@keyframes sw-float {
+  from {
+    transform: translateY(2%);
+  }
+  to {
+    transform: translateY(-3%);
+  }
+}
+
+/* A hairline of ice along the top edge; the single cheapest trick that makes
+   a flat card look like a lit object. Above the background, below content.
+   Deliberately does NOT set `position`: this file is emitted after Tailwind's
+   utilities, so a `position: relative` here silently clobbered the sheet
+   panel's `absolute` and pinned it to the top of the popup. The host brings
+   its own positioning (sw-wallet-card and the sheet panel both do). */
+.sw-edge-light::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in oklab, var(--sw-ice) 70%, transparent),
+    transparent
+  );
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+/* Text set in the brand gradient (website: sw-gradient-text). Aubergine-
+   dominant on purpose; it only leans toward ice at the very end so the word
+   stays purple and legible. Fails open to plain accent text where
+   background-clip or forced-colors would otherwise blank the heading. */
+.sw-gradient-text {
+  background-image: linear-gradient(
+    100deg,
+    var(--sw-accent-fg) 0%,
+    var(--sw-accent-fg) 55%,
+    color-mix(in oklab, var(--sw-accent-fg) 45%, var(--sw-ice-fg)) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+@supports not ((background-clip: text) or (-webkit-background-clip: text)) {
+  .sw-gradient-text {
+    background-image: none;
+    color: var(--sw-accent-fg);
+    -webkit-text-fill-color: currentColor;
+  }
+}
+@media (forced-colors: active) {
+  .sw-gradient-text {
+    background-image: none;
+    color: CanvasText;
+    -webkit-text-fill-color: currentColor;
+  }
+}
+
+/*
+ * Aurora backdrop: two blurred brand-colour blobs drifting very slowly behind
+ * the whole popup; the website hero's atmosphere at popup scale. The parent
+ * must be `relative isolate`; z-index -1 then paints the blobs above the
+ * parent's own background but below every in-flow child, so no content ever
+ * needs a z-index of its own. Decorative only (aria-hidden in the markup).
+ */
+.sw-aurora {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+}
+.sw-aurora::before,
+.sw-aurora::after {
+  content: '';
+  position: absolute;
+  width: 340px;
+  height: 340px;
+  border-radius: 50%;
+  filter: blur(70px);
+}
+.sw-aurora::before {
+  top: -160px;
+  left: -120px;
+  background: var(--sw-accent);
+  opacity: 0.16;
+}
+.sw-aurora::after {
+  bottom: -180px;
+  right: -140px;
+  background: var(--sw-ice);
+  opacity: 0.1;
+}
+/* On white the same blobs would read as smudges, keep them fainter. */
+@media (prefers-color-scheme: light) {
+  .sw-aurora::before {
+    opacity: 0.1;
+  }
+  .sw-aurora::after {
+    opacity: 0.08;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .sw-aurora::before {
+    animation: sw-aurora-a 26s ease-in-out infinite alternate;
+  }
+  .sw-aurora::after {
+    animation: sw-aurora-b 34s ease-in-out infinite alternate;
+  }
+}
+@keyframes sw-aurora-a {
+  from {
+    transform: translate3d(-6%, -3%, 0) scale(1);
+  }
+  to {
+    transform: translate3d(10%, 8%, 0) scale(1.18);
+  }
+}
+@keyframes sw-aurora-b {
+  from {
+    transform: translate3d(6%, 5%, 0) scale(1.12);
+  }
+  to {
+    transform: translate3d(-8%, -6%, 0) scale(0.95);
+  }
+}
+
+/* Screen transition: the incoming screen rises softly into place. Applied to
+   the keyed screen container in App.tsx, so it plays exactly once per
+   navigation. Final frame immediately under prefers-reduced-motion.
+   NO fill-mode on purpose: with `both`, Chromium keeps treating the element
+   as transformed after the animation ends, which makes it a permanent
+   containing block for fixed descendants; the bottom sheets then anchor to
+   this wrapper instead of the popup viewport. Without fill the animation
+   stops applying after 220 ms and the base styles (no transform) return. */
+.sw-screen-in {
+  animation: sw-screen-in 0.22s cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+@keyframes sw-screen-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sw-screen-in {
+    animation: none;
+  }
+}

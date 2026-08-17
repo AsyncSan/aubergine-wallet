@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output and WXT's generated project files.
+# These MUST stay ignored: Tailwind v4's automatic content detection walks the
+# project and skips gitignored paths. With `.output/` tracked, a previous build
+# is scanned as if it were source and utility classes are harvested out of
+# bundled third-party code (qrcode-generator's inline `border-collapse` /
+# `resize` strings), so `build:chrome && build:firefox` emitted a different CSS
+# asset than a clean `build:firefox`. Belt and braces: the CSS entry also pins
+# its own sources with `source(none)` + explicit `@source` (entrypoints/popup/style.css).
+.output/
+.wxt/
+
+# Playwright artifacts. `e2e/screenshots/` belongs here too: it is 2.5 MB of
+# PNGs that every `npm run test:e2e` regenerates, so committing it would put a
+# build output under review on every run without telling anyone anything.
+test-results/
+playwright-report/
+e2e-shots/
+e2e/screenshots/
+
+# Local secrets (Soroswap API key etc.) — never committed, never in the AMO source zip.
+.env.local
+.env.*.local
