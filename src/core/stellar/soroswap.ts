@@ -138,6 +138,48 @@ export interface SoroswapQuote {
 }
 
 /**
+ * Der Boden, den der Nutzer versprochen bekommt: `amountOut` abzüglich der
+ * Slippage, die er selbst eingestellt hat, exakt in Stroops abgerundet.
+ *
+ * DIESE FUNKTION EXISTIERT WEGEN EINES LIVE-BEFUNDS (18.08.2026, Mainnet).
+ * Vorher galt `otherAmountThreshold` aus der `/quote`-Antwort als der
+ * garantierte Boden. Das ist es nicht: die API lieferte
+ * `otherAmountThreshold === amountOut`, also gar keine Slippage, während
+ * `/quote/build` in denselben Envelope
+ * `amount_out_min = amountOut * (1 - slippage)` schrieb. Zwei unabhängige
+ * Messungen am gepinnten Mainnet-Router:
+ *
+ *   amountOut 64909597 -> Envelope 64585050   (exakt 50,000 bps)
+ *   amountOut 74456861 -> Envelope 74084577   (exakt 50,000 bps)
+ *
+ * Zwei Folgen, beide ernst:
+ *
+ * 1. `verifySoroswapEnvelope` verlangte `amount_out_min >= otherAmountThreshold`
+ *    und lehnte damit JEDEN echten Envelope ab
+ *    (`SWAP_ENVELOPE_MISMATCH: entry call guarantees … instead of the promised
+ *    minimum …`). Die Aggregator-Route war auf Mainnet vollständig tot —
+ *    fail-closed, aber tot.
+ * 2. Schwerer noch: der Swap-Bildschirm zeigte `otherAmountThreshold` als
+ *    „du bekommst mindestens X". Das war der ERWARTETE Betrag, nicht der
+ *    garantierte. Die signierten Bytes trugen 0,5 % weniger. Ein Versprechen,
+ *    das die Signatur nicht deckt, ist genau das, was der Wächter verhindern
+ *    soll.
+ *
+ * Warum abrunden und nicht runden: die API rundet kaufmännisch (Fall 2 trifft
+ * `round`, Fall 1 liegt eine Stroop darüber). Abrunden ist der kleinere Wert,
+ * das Versprechen bleibt also in jedem Fall gedeckt.
+ *
+ * Warum nicht einfach `min(otherAmountThreshold, floor)`: {@link
+ * thresholdIsConsistent} läuft vorher und verwirft jede Quote, deren
+ * Schwellwert UNTER diesem Boden liegt. Der API-Wert kann hier also nie der
+ * kleinere sein; ein `min` wäre toter Code, der Sicherheit vortäuscht.
+ */
+export function slippageFloor(amountOutStroops: string, slippageBps: number): string {
+  const bps = BigInt(Math.max(0, Math.min(10_000, Math.trunc(slippageBps))));
+  return ((BigInt(amountOutStroops) * (10_000n - bps)) / 10_000n).toString();
+}
+
+/**
  * Does the API's own `otherAmountThreshold` actually correspond to the slippage
  * we asked for? Exact BigInt stroop arithmetic, no float: the threshold must sit
  * between `amountOut * (1 - slippage)` and `amountOut` itself. A threshold above
@@ -232,14 +274,15 @@ export async function fetchSoroswapQuote(
     // fine and would render "at least 0,0000001 USDC" with no warning anywhere.
     // Drop such a quote rather than display it (fail-closed to the DEX route).
     if (!thresholdIsConsistent(amountOut, threshold, slippageBps)) return null;
+    const promisedFloor = slippageFloor(amountOut, slippageBps);
     return {
       destAmount: stroopsToAmount(amountOut),
-      minReceived: stroopsToAmount(threshold),
+      minReceived: stroopsToAmount(promisedFloor),
       priceImpactPct: parsed.data.priceImpactPct ?? null,
       platform: parsed.data.platform ?? null,
       amountInStroops: amountIn,
       amountOutStroops: amountOut,
-      minOutStroops: threshold,
+      minOutStroops: promisedFloor,
       sendAssetContract,
       destAssetContract,
       raw: parsed.data as Record<string, unknown>,

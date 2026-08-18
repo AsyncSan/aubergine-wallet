@@ -2,7 +2,7 @@
   "name": "aubergine-extension",
   "private": true,
   "license": "Apache-2.0",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "description": "Aubergine browser extension (working title) - Stellar wallet that grows with you",
   "scripts": {
@@ -18,7 +18,8 @@
     "postinstall": "wxt prepare",
     "test:e2e": "playwright test -c e2e/playwright.config.ts",
     "test:testnet": "vitest run --config vitest.integration.config.ts",
-    "test:mainnet": "vitest run --config vitest.integration.mainnet.config.ts"
+    "test:mainnet": "vitest run --config vitest.integration.mainnet.config.ts",
+    "pruefen": "bash scripts/selbstpruefung.sh"
   },
   "dependencies": {
     "@scure/bip39": "^2.2.0",

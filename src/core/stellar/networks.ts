@@ -337,8 +337,30 @@ export function checkSorobanEndpoint(url: string): EndpointRejection | null {
  * default network on a fresh install, in both modes). */
 export const INSTALL_TIME_ORIGINS: readonly string[] = originsForNetwork('testnet');
 
-/** What the dApp connector's content script needs (developer mode only). */
-export const DAPP_CONNECTOR_ORIGINS: readonly string[] = ['http://*/*', 'https://*/*'];
+/**
+ * What the dApp connector's content script needs (developer mode only).
+ *
+ * Deliberately **not** `http://*\/*`. On a plaintext page anyone on the network
+ * path controls what the page contains, and could drive `signTransaction`
+ * through the provider; the confirmation prompt would then be the only thing
+ * left between an attacker and a signature. Over https that lever does not
+ * exist. Loopback stays in, because a dApp under development is served from
+ * there (`e2e/support/test-page.ts`) and a man in the middle on localhost
+ * already owns the machine.
+ *
+ * Match patterns ignore the port, so `http://localhost/*` also covers
+ * `http://localhost:5173`.
+ *
+ * `wxt.config.ts` repeats these patterns in `optional_host_permissions` and in
+ * the `inject.js` `web_accessible_resources` entry; `tests/manifest.test.ts`
+ * fails if the three drift apart, because `chrome.permissions.request()` is
+ * called with exactly this list.
+ */
+export const DAPP_CONNECTOR_ORIGINS: readonly string[] = [
+  'https://*/*',
+  'http://localhost/*',
+  'http://127.0.0.1/*',
+];
 
 /* ----------------------------------------------------------- trustlines */
 

@@ -25,13 +25,18 @@ import { dirname, join } from 'node:path';
 import { glob } from 'tinyglobby';
 import { describe, expect, it } from 'vitest';
 import config from '../wxt.config';
+import { DAPP_CONNECTOR_ORIGINS } from '../src/core/stellar/networks';
 
 const ROOT = join(__dirname, '..');
 
 type GeneratedManifest = {
+  version?: string;
+  minimum_chrome_version?: string;
   icons?: Record<string, string>;
   action?: { default_icon?: Record<string, string>; default_title?: string };
-  browser_specific_settings?: { gecko?: { id?: string } };
+  browser_specific_settings?: { gecko?: { id?: string; strict_min_version?: string } };
+  optional_host_permissions?: string[];
+  host_permissions?: string[];
   web_accessible_resources?: {
     resources: string[];
     matches: string[];
@@ -106,8 +111,9 @@ describe('web_accessible_resources', () => {
     expect(entry?.use_dynamic_url, 'any site can probe inject.js and fingerprint the wallet').toBe(
       true,
     );
-    // The content script still needs page access to inject the provider.
-    expect(entry?.matches).toEqual(['http://*/*', 'https://*/*']);
+    // The content script still needs page access to inject the provider, but
+    // only on the origins it can actually run on.
+    expect(entry?.matches).toEqual([...DAPP_CONNECTOR_ORIGINS]);
   });
 
   it('omits the Chrome-only key on Firefox, which randomises the origin anyway', () => {
@@ -129,6 +135,71 @@ describe('web_accessible_resources', () => {
   });
 });
 
+describe('dApp connector host access', () => {
+  /**
+   * The three lists have to agree or the feature breaks in a way no unit test
+   * of the domain logic would notice: `chrome.permissions.request()` rejects a
+   * pattern that is not in `optional_host_permissions`, and `inject.js` is
+   * unreachable from an origin missing from `web_accessible_resources`.
+   */
+  it.each(['chrome', 'firefox'])(
+    'offers exactly the patterns the connector requests (%s)',
+    (browser) => {
+      const manifest = manifestFor(browser);
+      for (const pattern of DAPP_CONNECTOR_ORIGINS) {
+        expect(
+          manifest.optional_host_permissions ?? [],
+          `permissions.request() would be rejected for ${pattern}`,
+        ).toContain(pattern);
+      }
+      const entry = (manifest.web_accessible_resources ?? []).find((r) =>
+        r.resources.includes('inject.js'),
+      );
+      expect(entry?.matches).toEqual([...DAPP_CONNECTOR_ORIGINS]);
+    },
+  );
+
+  /**
+   * The finding this replaces: `http://*` was granted alongside `https://*`.
+   * On a plaintext page an attacker on the network path writes the page, so
+   * they can call `signTransaction`, and the confirmation prompt is then the
+   * only remaining defence. Loopback is exempt — owning it means owning the
+   * machine — and the e2e dApp is served from 127.0.0.1.
+   */
+  it.each(['chrome', 'firefox'])('never asks for plaintext http beyond loopback (%s)', (browser) => {
+    const manifest = manifestFor(browser);
+    const patterns = [
+      ...(manifest.host_permissions ?? []),
+      ...(manifest.optional_host_permissions ?? []),
+      ...(manifest.web_accessible_resources ?? []).flatMap((r) => r.matches),
+    ];
+    const loopback = /^http:\/\/(localhost|127\.0\.0\.1)\//u;
+    for (const pattern of patterns) {
+      if (!pattern.startsWith('http://')) continue;
+      expect(pattern, `${pattern} exposes the provider to a plaintext origin`).toMatch(loopback);
+    }
+  });
+});
+
+describe('browser_specific_settings.gecko strict_min_version', () => {
+  /**
+   * `data_collection_permissions` is understood by Firefox Desktop from 140
+   * but by Firefox for Android only from 142. With 140 here, addons-linter
+   * raises KEY_FIREFOX_ANDROID_UNSUPPORTED_BY_MIN_VERSION on every upload.
+   */
+  it('is at least 142, the Android floor for the data collection declaration', () => {
+    const gecko = manifestFor('firefox').browser_specific_settings?.gecko;
+    const version = gecko?.strict_min_version;
+    expect(version, 'no strict_min_version; AMO cannot tell what we support').toBeDefined();
+    const major = Number.parseInt((version ?? '0').split('.')[0] ?? '0', 10);
+    expect(major).toBeGreaterThanOrEqual(142);
+  });
+
+  it('is absent on Chrome, which has no gecko block at all', () => {
+    expect(manifestFor('chrome').browser_specific_settings).toBeUndefined();
+  });
+});
+
 describe('browser_specific_settings.gecko.id', () => {
   const RESERVED = /@(.+\.)?(example\.(com|org|net)|test|invalid|localhost|example)$/u;
 
@@ -142,6 +213,60 @@ describe('browser_specific_settings.gecko.id', () => {
 
   it('is not emitted for Chrome', () => {
     expect(manifestFor('chrome').browser_specific_settings).toBeUndefined();
+  });
+});
+
+/** The single source of truth for the version, as npm and WXT both read it. */
+function pkgVersion(): string {
+  return (JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as { version: string })
+    .version;
+}
+
+/**
+ * Two numbers a store reviewer reads and neither unit nor e2e tests can see.
+ *
+ *  - **The version.** A store version can only ever go up. Publishing 0.x
+ *    would mean the listing carries "preview" forever, or a jump that loses
+ *    the update path. It also has to match `package.json`, because that is
+ *    what `npm run zip` names the artefacts after.
+ *  - **`minimum_chrome_version`.** Without it Chrome installs the package on
+ *    browsers that cannot parse it: the Vite build targets `chrome110`, so on
+ *    Chrome 109 the user gets a wallet that fails at load with a syntax error
+ *    rather than a message saying the browser is too old.
+ */
+describe('version and minimum browser', () => {
+  it('matches package.json in both artefacts', () => {
+    for (const browser of ['chrome', 'firefox']) {
+      expect(manifestFor(browser).version, `${browser} manifest version drifted`).toBe(
+        pkgVersion(),
+      );
+    }
+  });
+
+  it('is at least 1.0.0; the store never takes a version back down', () => {
+    const major = Number.parseInt(pkgVersion().split('.')[0] ?? '0', 10);
+    expect(major, `version ${pkgVersion()} still reads as a preview`).toBeGreaterThanOrEqual(1);
+  });
+
+  it('declares minimum_chrome_version, and not below the Vite build target', () => {
+    const declared = manifestFor('chrome').minimum_chrome_version;
+    expect(
+      declared,
+      'no minimum_chrome_version; Chrome would install on browsers the build broke',
+    ).toBeDefined();
+
+    // `vite.build.target` is the only place that says which syntax we emit.
+    // Reading it here is what turns the manifest number into a checked claim
+    // instead of a comment: raise the target and this test goes red.
+    const viteConfig = (config.vite as unknown as () => { build?: { target?: string } })();
+    const target = viteConfig.build?.target ?? '';
+    const targeted = Number.parseInt(target.replace(/^chrome/u, ''), 10);
+    expect(targeted, `build target ${target} is not a chrome<N> target`).toBeGreaterThan(0);
+    expect(Number.parseInt(declared ?? '0', 10)).toBeGreaterThanOrEqual(targeted);
+  });
+
+  it('does not put minimum_chrome_version into the Firefox manifest', () => {
+    expect(manifestFor('firefox').minimum_chrome_version).toBeUndefined();
   });
 });
 
@@ -242,7 +367,10 @@ describe('AMO sources zip', () => {
   });
 
   it('the generated sources zip matches that shape', () => {
-    const zip = join(ROOT, '.output', 'aubergine-extension-0.1.0-sources.zip');
+    // Derived, never hard-coded: with a literal version here the file stops
+    // existing after the next version bump and the whole assertion below
+    // silently turns into a no-op.
+    const zip = join(ROOT, '.output', `aubergine-extension-${pkgVersion()}-sources.zip`);
     if (!existsSync(zip)) return; // only produced by `npm run zip`
     const raw = readFileSync(zip);
     const names = [...raw.toString('latin1').matchAll(/PK\x03\x04[\s\S]{22}/gu)].map((m) => {

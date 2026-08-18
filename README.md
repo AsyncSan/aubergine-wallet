@@ -89,7 +89,8 @@ move and the network deduplicates it.
 
 - Node.js 22 or newer
 - npm 10 or newer (this project uses npm and `package-lock.json`, not pnpm)
-- Chrome or Chromium 110+, or Firefox 140+
+- Chrome or Chromium 110+ (`minimum_chrome_version` in the manifest), or
+  Firefox 142+ (`strict_min_version`; see the note under "Load it in Firefox")
 
 ---
 
@@ -127,8 +128,40 @@ signed build.
 The Firefox manifest already carries the data collection declaration AMO has
 required for new submissions since 3 November 2025:
 `browser_specific_settings.gecko.data_collection_permissions.required =
-["none"]`, which needs Firefox Desktop 140+ or Android 142+. The wallet
-collects nothing at all, which is invariant 4 below.
+["none"]`, which needs Firefox Desktop 140+ or Android 142+. `strict_min_version`
+is therefore 142, the higher of the two. The wallet collects nothing at all,
+which is invariant 4 below.
+
+### Notes for add-on reviewers
+
+The published package is bundled by Vite, so this repository is submitted as
+the source archive alongside it. Everything below is meant to reproduce the
+uploaded artifact in the default AMO review environment (Ubuntu 24.04 LTS,
+ARM64, Node 22 LTS, npm 10). No other operating system, tool or account is
+needed, and no step reaches the network except `npm ci`.
+
+```bash
+npm ci                                  # installs from package-lock.json
+printf 'WXT_SOROSWAP_API_KEY=%s\n' "<key from the listing notes>" > .env.local
+npm run build:firefox                   # -> .output/firefox-mv3/
+npm run zip                             # -> .output/aubergine-extension-<version>-firefox.zip
+```
+
+Two things worth knowing while comparing the build to the upload:
+
+1. **`.env.local` is required to get an identical build.** `WXT_SOROSWAP_API_KEY`
+   is inlined at build time, so a build without it differs from the uploaded
+   package in exactly that one string. The value is not a secret: it is
+   readable in the published package by design, it authenticates this
+   extension against the Soroswap quote API and nothing else, and it carries
+   no user data. It is supplied in the reviewer notes of the submission.
+2. **`npm test` runs the full suite** (695 unit tests, no network) if you want
+   to see the behaviour the code claims. `npx addons-linter <zip>` reports 0
+   errors and 2 warnings. Both warnings are `UNSAFE_VAR_ASSIGNMENT` on
+   `innerHTML` inside the bundled React DOM runtime, in its
+   `dangerouslySetInnerHTML` branch. Neither `innerHTML` nor
+   `dangerouslySetInnerHTML` appears anywhere in `src/` or `entrypoints/`;
+   `grep -rn "innerHTML" src entrypoints` returns nothing.
 
 ### First steps on the test network
 

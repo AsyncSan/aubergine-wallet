@@ -12,11 +12,11 @@ import type { BrowserContext, Route } from '@playwright/test';
 import {
   Account,
   Address,
-  Asset,
   Networks,
   Operation,
   SorobanDataBuilder,
   TransactionBuilder,
+  nativeToScVal,
   xdr,
 } from '@stellar/stellar-sdk';
 import {
@@ -67,25 +67,146 @@ function hashOfEnvelope(submittedXdr: string): string {
 }
 
 /**
- * What the Soroswap `/quote/build` mock hands back: a real, footprinted
- * invokeHostFunction envelope for exactly the `from` the background sent,
- * so the spec can assert that these bytes (and nothing else) get signed
- * and submitted.
+ * The Testnet Soroswap aggregator, DELIBERATELY HARD-CODED here instead of
+ * imported from `src/core/stellar/soroswap`.
+ *
+ * Importing `SOROSWAP_ENTRIES` would make this mock follow every change to the
+ * pinned list, so a wrong edit to the production constant would still produce a
+ * green e2e run: the mock and the code under test would agree with each other
+ * about something neither of them checks. Written out separately, the mock is
+ * an independent second statement of the same claim, and a mutation of the
+ * pinned id turns spec 19 red. Same reasoning as the hard-coded hash in the
+ * submit mock.
+ *
+ * Source: github.com/soroswap/aggregator, `public/testnet.contracts.json`,
+ * `ids.aggregator` (fetched 2026-08-17).
  */
-function soroswapBuiltEnvelope(from: string, sequence: string): string {
-  const contract = Asset.native().contractId(Networks.TESTNET);
-  const func = xdr.HostFunction.hostFunctionTypeInvokeContract(
-    new xdr.InvokeContractArgs({
-      contractAddress: new Address(contract).toScAddress(),
-      functionName: 'swap',
-      args: [],
+const SOROSWAP_TESTNET_AGGREGATOR =
+  'CC74XDT7UVLUZCELKBIYXFYIX6A6LGPWURJVUXGRPQO745RWX7WEURMA';
+
+/**
+ * A stand-in for a pool/adapter the route passes through: some contract that
+ * is neither the aggregator nor one of the two token SACs. It is the recipient
+ * of the authorised `transfer`, exactly as in a real route, and it exists to
+ * prove that the guard does NOT require the counterparty to be known, only the
+ * token and the amount. Any `C…` id would do; the published Testnet router is
+ * used because it is a real address and needs no invention.
+ */
+const SOROSWAP_TESTNET_ROUTE_HOP =
+  'CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD';
+
+/** The `/quote` the aggregator last answered; `/quote/build` builds from it. */
+export interface SoroswapQuoteMemo {
+  readonly assetIn: string;
+  readonly assetOut: string;
+  readonly amountIn: string;
+  readonly amountOutMin: string;
+}
+
+function i128(value: string): xdr.ScVal {
+  return nativeToScVal(BigInt(value), { type: 'i128' });
+}
+
+function addr(contractOrAccount: string): xdr.ScVal {
+  return Address.fromString(contractOrAccount).toScVal();
+}
+
+/**
+ * The contract call a real aggregator build returns, in the shape the wallet's
+ * envelope guard was written against:
+ *
+ *   swap_exact_tokens_for_tokens(token_in, token_out, amount_in,
+ *                                amount_out_min, distribution, to, deadline)
+ *
+ * on the pinned Testnet aggregator, plus one authorization entry whose tree
+ * carries the single `transfer(user, hop, amount_in)` that pays for the swap.
+ *
+ * WHY THIS SHAPE MATTERS. The previous version of this function called the XLM
+ * SAC's `swap` with zero arguments. It predates the envelope guard of
+ * 2026-08-17 and was rejected by it, correctly, so the aggregator route had no
+ * working end-to-end coverage at all: the one spec that passed never built an
+ * aggregator envelope. A mock that the guard refuses proves the guard says no;
+ * only a mock it accepts proves the guard still says yes to a real swap, which
+ * is the half that carries the risk of shipping a dead swap button.
+ */
+export function soroswapBuiltEnvelope(
+  from: string,
+  sequence: string,
+  quote: SoroswapQuoteMemo,
+): string {
+  const args = [
+    addr(quote.assetIn), //                                   0 token_in
+    addr(quote.assetOut), //                                  1 token_out
+    i128(quote.amountIn), //                                  2 amount_in
+    i128(quote.amountOutMin), //                              3 amount_out_min
+    xdr.ScVal.scvVec([
+      //                                                      4 distribution
+      xdr.ScVal.scvMap([
+        // ScMap keys must be in ascending order; these already are.
+        new xdr.ScMapEntry({
+          key: xdr.ScVal.scvSymbol('is_exact_in'),
+          val: xdr.ScVal.scvBool(true),
+        }),
+        new xdr.ScMapEntry({
+          key: xdr.ScVal.scvSymbol('parts'),
+          val: xdr.ScVal.scvU32(1),
+        }),
+        new xdr.ScMapEntry({
+          key: xdr.ScVal.scvSymbol('path'),
+          val: xdr.ScVal.scvVec([addr(quote.assetIn), addr(quote.assetOut)]),
+        }),
+        new xdr.ScMapEntry({
+          key: xdr.ScVal.scvSymbol('protocol_id'),
+          val: xdr.ScVal.scvString('soroswap'),
+        }),
+      ]),
+    ]),
+    addr(from), //                                            5 to
+    nativeToScVal(1_900_000_000, { type: 'u64' }), //         6 deadline
+  ];
+
+  const entryCall = new xdr.InvokeContractArgs({
+    contractAddress: new Address(SOROSWAP_TESTNET_AGGREGATOR).toScAddress(),
+    functionName: 'swap_exact_tokens_for_tokens',
+    args,
+  });
+
+  /**
+   * The payment leg, one level down in the auth tree exactly where a real
+   * aggregator puts it: the user hands `amount_in` of the sold token to the
+   * first hop. This is the single outflow the guard demands, and putting it in
+   * a sub-invocation rather than at the root is deliberate, that is the
+   * position the drain variant of the June report used.
+   */
+  const transferLeg = new xdr.SorobanAuthorizedInvocation({
+    function: xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(
+      new xdr.InvokeContractArgs({
+        contractAddress: new Address(quote.assetIn).toScAddress(),
+        functionName: 'transfer',
+        args: [addr(from), addr(SOROSWAP_TESTNET_ROUTE_HOP), i128(quote.amountIn)],
+      }),
+    ),
+    subInvocations: [],
+  });
+
+  const auth = new xdr.SorobanAuthorizationEntry({
+    credentials: xdr.SorobanCredentials.sorobanCredentialsSourceAccount(),
+    rootInvocation: new xdr.SorobanAuthorizedInvocation({
+      function: xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(entryCall),
+      subInvocations: [transferLeg],
     }),
-  );
+  });
+
   return new TransactionBuilder(new Account(from, sequence), {
     fee: '1000000',
     networkPassphrase: Networks.TESTNET,
   })
-    .addOperation(Operation.invokeHostFunction({ func, auth: [] }))
+    .addOperation(
+      Operation.invokeHostFunction({
+        func: xdr.HostFunction.hostFunctionTypeInvokeContract(entryCall),
+        auth: [auth],
+      }),
+    )
     .setSorobanData(new SorobanDataBuilder().setResourceFee('500000').build())
     .setTimeout(300)
     .build()
@@ -131,6 +252,14 @@ export class HorizonMock {
   soroswapRate: number | null = null;
   /** Envelopes the Soroswap build endpoint handed out. */
   readonly soroswapBuilt: string[] = [];
+  /**
+   * The `/quote` this mock last answered. `/quote/build` builds its envelope
+   * from it, the way a real aggregator does: the tokens and amounts in the
+   * built call are the ones it quoted, not constants invented at build time.
+   * That is what makes spec 19 able to fail, an envelope over the wrong token
+   * or the wrong size is exactly what the guard exists to catch.
+   */
+  lastSoroswapQuote: SoroswapQuoteMemo | null = null;
   /**
    * What `GET /transactions/{hash}` answers; the lookup the wallet uses to
    * resolve a submission whose outcome it does not know. `not-found` (the
@@ -194,6 +323,12 @@ export class HorizonMock {
         const slippageBps = Number(body['slippageBps'] ?? 50);
         const amountOut = Math.floor(amountIn * this.soroswapRate);
         const threshold = Math.floor((amountOut * (10_000 - slippageBps)) / 10_000);
+        this.lastSoroswapQuote = {
+          assetIn: String(body['assetIn'] ?? ''),
+          assetOut: String(body['assetOut'] ?? ''),
+          amountIn: String(amountIn),
+          amountOutMin: String(threshold),
+        };
         return json(route, 200, {
           amountIn: String(amountIn),
           amountOut: String(amountOut),
@@ -208,7 +343,14 @@ export class HorizonMock {
         // exactly what a live aggregator would return for this account.
         const from = String(body['from'] ?? '');
         const sequence = this.accounts.get(from)?.sequence ?? '4611686044486139904';
-        const envelope = soroswapBuiltEnvelope(from, sequence);
+        const quote = this.lastSoroswapQuote;
+        if (quote === null) {
+          // A build without a preceding quote is not a state a real client can
+          // reach; answering it with an invented envelope would hide the bug.
+          this.unmocked.push(`${request.method()} ${request.url()} (no preceding /quote)`);
+          return json(route, 501, { title: 'build without quote', status: 501 });
+        }
+        const envelope = soroswapBuiltEnvelope(from, sequence, quote);
         this.soroswapBuilt.push(envelope);
         return json(route, 200, { xdr: envelope });
       }

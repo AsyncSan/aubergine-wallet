@@ -16,6 +16,7 @@ import {
   registeredScripts,
   stubPermissionRequest,
 } from '../support/flows';
+import { DAPP_CONNECTOR_ORIGINS } from '../../src/core/stellar/networks';
 
 test('declining the dApp permission leaves a consistent state, not a half switch', async ({
   popup,
@@ -27,9 +28,9 @@ test('declining the dApp permission leaves a consistent state, not a half switch
   await openSettings(popup);
   await enableDeveloperMode(popup);
 
-  // What was asked for is exactly the connector's two wildcards.
+  // What was asked for is exactly the connector's origin patterns.
   expect(await permissionRequests(popup)).toEqual([
-    { origins: ['http://*/*', 'https://*/*'] },
+    { origins: [...DAPP_CONNECTOR_ORIGINS] },
   ]);
 
   // The declined branch is visible, in words, and not silent.

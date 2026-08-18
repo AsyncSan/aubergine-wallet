@@ -13,7 +13,15 @@ export default defineConfig({
     name: 'Aubergine',
     description: '__MSG_extDescription__',
     default_locale: 'en',
-    version: '0.1.0',
+    version: '1.0.0',
+    /**
+     * Chrome refuses to install the package on anything older, instead of
+     * installing it and breaking at runtime. 110 is not a guess: the Vite
+     * build below targets `chrome110`, so anything below this line receives
+     * syntax it cannot parse. A unit test binds the two together.
+     * Firefox has no such key, its floor is `strict_min_version` below.
+     */
+    ...(browser === 'firefox' ? {} : { minimum_chrome_version: '110' }),
     // Invariant 3: no remote code. Invariant 4: no analytics endpoints.
     // `clipboardWrite` is deliberately absent: `navigator.clipboard.writeText`
     // from a focused extension page does not need it.
@@ -65,8 +73,13 @@ export default defineConfig({
       'https://horizon-futurenet.stellar.org/*',
       'https://rpc-futurenet.stellar.org/*',
       'https://friendbot-futurenet.stellar.org/*',
-      'http://*/*',
+      // The dApp connector's web access; developer mode only, requested from
+      // a user gesture. Mirrors `DAPP_CONNECTOR_ORIGINS` in
+      // `src/core/stellar/networks.ts` — `http://*/*` was dropped there on
+      // purpose, the reason is on that constant.
       'https://*/*',
+      'http://localhost/*',
+      'http://127.0.0.1/*',
     ],
     /**
      * Toolbar icon. The PNGs live in `public/icon/{16,32,48,128}.png`; WXT
@@ -97,8 +110,11 @@ export default defineConfig({
               // documentation domain we can never prove ownership of.
               // Only the id changes here; the product rename is separate work.
               id: 'wallet@aubergine.tech',
-              // 140+ is required for the data collection declaration below.
-              strict_min_version: '140.0',
+              // 142, not 140: Desktop understands the data collection
+              // declaration below from 140, but Firefox for Android only from
+              // 142, and addons-linter warns on every upload while the two
+              // disagree. The price is Desktop 140/141 and the ESR 140 branch.
+              strict_min_version: '142.0',
               /**
                * AMO requires an explicit data collection declaration for all
                * new submissions since 2025-11-03 (Firefox Desktop 140+,
@@ -223,7 +239,9 @@ export default defineConfig({
     web_accessible_resources: [
       {
         resources: ['inject.js'],
-        matches: ['http://*/*', 'https://*/*'],
+        // Same set as `DAPP_CONNECTOR_ORIGINS`: `inject.js` has no business
+        // being reachable from an origin the content script can never run on.
+        matches: ['https://*/*', 'http://localhost/*', 'http://127.0.0.1/*'],
         ...(browser === 'firefox' ? {} : { use_dynamic_url: true }),
       },
     ],

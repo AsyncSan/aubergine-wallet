@@ -15,12 +15,27 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HorizonMock, LOG_SINK_URL } from '../fixtures/horizon-mock';
+import { DAPP_CONNECTOR_ORIGINS } from '../../src/core/stellar/networks';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const EXTENSION_PATH =
   process.env['E2E_EXTENSION_PATH'] ?? path.resolve(here, '../../.output/chrome-mv3');
+/**
+ * Which Chromium to drive, in order of preference:
+ *
+ *  1. `E2E_CHROMIUM`, if you want to point at a specific binary.
+ *  2. The pinned path of the Linux build image, when it exists there.
+ *  3. Whatever Playwright resolves itself (`npx playwright install chromium`),
+ *     which is what makes this suite runnable on a developer machine.
+ *
+ * Do **not** substitute a released Google Chrome: `--load-extension` was
+ * removed from it in Chrome 137, so the extension would never load. Playwright's
+ * own Chromium still accepts the flag.
+ */
+const PINNED_CHROMIUM = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 export const CHROMIUM_EXECUTABLE =
-  process.env['E2E_CHROMIUM'] ?? '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+  process.env['E2E_CHROMIUM'] ??
+  (fs.existsSync(PINNED_CHROMIUM) ? PINNED_CHROMIUM : chromium.executablePath());
 export const SCREENSHOT_DIR = path.resolve(here, '../screenshots');
 
 export interface CollectedError {
@@ -91,7 +106,7 @@ const SW_HOOK = (sink: string): boolean => {
 };
 
 /**
- * Copy the built artefact and move the two dApp-connector wildcards from
+ * Copy the built artefact and move the dApp-connector patterns from
  * `optional_host_permissions` into `host_permissions`.
  *
  * Why this exists: `chrome.permissions.request()` opens a *native* browser
@@ -110,7 +125,7 @@ function makePreGrantedExtension(): string {
     host_permissions: string[];
     optional_host_permissions: string[];
   };
-  const wildcards = ['http://*/*', 'https://*/*'];
+  const wildcards = [...DAPP_CONNECTOR_ORIGINS];
   manifest.host_permissions = [...manifest.host_permissions, ...wildcards];
   manifest.optional_host_permissions = manifest.optional_host_permissions.filter(
     (pattern) => !wildcards.includes(pattern),

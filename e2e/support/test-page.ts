@@ -1,10 +1,11 @@
 /**
  * A loopback web server for the dApp tests.
  *
- * The content script is registered for `http://*` / `https://*`, so the test
- * page has to be served over HTTP; a `data:` or `file:` URL would not match,
- * and there is no outbound network in this environment. 127.0.0.1 is enough:
- * the extension treats it like any other origin.
+ * The content script is registered for `https://*` plus loopback (see
+ * `DAPP_CONNECTOR_ORIGINS`), so the test page is served over plain HTTP from
+ * 127.0.0.1; a `data:` or `file:` URL would not match, and there is no
+ * outbound network in this environment. Loopback is the only plaintext origin
+ * the connector still accepts, which is exactly why the server binds there.
  */
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
