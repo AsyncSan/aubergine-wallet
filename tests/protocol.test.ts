@@ -330,3 +330,57 @@ describe('the developer-mode fee override is format-bounded', () => {
     ).not.toThrow();
   });
 });
+
+/**
+ * The strength floor for a *new* vault is enforced at this boundary, not only
+ * by the Continue button in Onboarding. `core/password-strength` explains the
+ * calibration: the keystore blob can be taken and ground offline against
+ * Argon2id, which buys ~15-20 bits, so the password has to carry the rest.
+ * A rule that lives only in a `disabled` attribute is a suggestion.
+ */
+describe('the vault-creation password floor is enforced at the RPC edge', () => {
+  const CREATION_METHODS = ['wallet.create', 'wallet.importMnemonic'] as const;
+  const MNEMONIC =
+    'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+  function paramsFor(method: (typeof CREATION_METHODS)[number], password: string): unknown {
+    return method === 'wallet.create' ? { password } : { password, mnemonic: MNEMONIC };
+  }
+
+  for (const method of CREATION_METHODS) {
+    it(`${method} refuses a password long enough but trivially guessable`, () => {
+      // Eight characters clears the length floor and nothing else.
+      for (const weak of ['password', 'passwort', 'qwertzui', '12345678', 'aaaaaaaa']) {
+        const parsed = rpcSchemas[method].params.safeParse(paramsFor(method, weak));
+        expect(parsed.success, `${weak} was accepted`).toBe(false);
+      }
+    });
+
+    it(`${method} still accepts a password with real entropy`, () => {
+      const parsed = rpcSchemas[method].params.safeParse(
+        paramsFor(method, 'correct horse battery'),
+      );
+      expect(parsed.success).toBe(true);
+    });
+
+    it(`${method} still refuses anything under eight characters`, () => {
+      expect(rpcSchemas[method].params.safeParse(paramsFor(method, 'Tr0ub4d')).success).toBe(
+        false,
+      );
+    });
+  }
+
+  /**
+   * Verifying an *existing* password must never gain a strength rule: an early
+   * adopter whose password predates the floor has to stay able to open, back
+   * up and extend their own wallet.
+   */
+  it('does not apply the floor to methods that verify an existing password', () => {
+    for (const method of ['wallet.unlock', 'wallet.revealRecoveryPhrase'] as const) {
+      expect(rpcSchemas[method].params.safeParse({ password: 'password' }).success).toBe(true);
+    }
+    expect(
+      rpcSchemas['account.add'].params.safeParse({ password: 'password', label: 'x' }).success,
+    ).toBe(true);
+  });
+});

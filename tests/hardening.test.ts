@@ -105,6 +105,7 @@ const {
   BASE_DELAY_MS,
   FREE_ATTEMPTS,
   MAX_DELAY_MS,
+  UnlockGuard,
   delayForFailures,
 } = await import('../src/background/unlock-guard');
 const { memoRequiredFromData } = await import('../src/core/stellar/horizon');
@@ -355,5 +356,71 @@ describe('prompt queue flood protection', () => {
       expect(() => queue.ask('sign', origin, null)).not.toThrow();
       queue.rejectAll();
     });
+  });
+});
+
+/**
+ * The lockout deadline is a wall-clock instant and the system clock belongs to
+ * whoever is sitting at the machine. These pin the two clock moves the guard
+ * can actually answer; the one it cannot is written up in the module header.
+ */
+describe('the unlock lockout does not simply believe the clock', () => {
+  /** A lockout written `agoMs` ago by a clock reading `at`. */
+  function seedLockout(at: number, delay = BASE_DELAY_MS): void {
+    localStore.set(GUARD_KEY, {
+      failures: FREE_ATTEMPTS + 1,
+      lockedUntil: at + delay,
+      lockedAt: at,
+    });
+  }
+
+  it('serves the full delay again when the clock is wound backwards', async () => {
+    const guard = new UnlockGuard();
+    const lockedAt = Date.now();
+    seedLockout(lockedAt);
+
+    // A reading from before the lockout was written cannot be honest.
+    const rewound = lockedAt - 24 * 3_600_000;
+    const err = await expectCode(guard.assertAllowed(rewound), 'UNLOCK_THROTTLED');
+    // Not "the deadline already passed": the whole delay, from the new reading.
+    expect(Number(err.detail)).toBeGreaterThan(BASE_DELAY_MS / 1000 - 2);
+
+    // And the record is re-anchored, so repeating the trick gains nothing.
+    const state = localStore.get(GUARD_KEY) as { lockedAt: number; lockedUntil: number };
+    expect(state.lockedAt).toBe(rewound);
+    expect(state.lockedUntil).toBe(rewound + BASE_DELAY_MS);
+  });
+
+  it('holds the lockout against a forward jump while the worker is alive', async () => {
+    const guard = new UnlockGuard();
+    localStore.set(GUARD_KEY, { failures: FREE_ATTEMPTS, lockedUntil: null, lockedAt: null });
+
+    // This worker imposes the lockout, so it holds a monotonic anchor for it.
+    await guard.registerFailure();
+    expect(guard.monotonicRemainingMs()).toBeGreaterThan(0);
+
+    // Ten years of "wall clock" later, the anchor has not moved at all.
+    await expectCode(
+      guard.assertAllowed(Date.now() + 10 * 365 * 24 * 3_600_000),
+      'UNLOCK_THROTTLED',
+    );
+  });
+
+  it('drops the anchor on a correct password, so an unlock is not delayed', async () => {
+    const guard = new UnlockGuard();
+    localStore.set(GUARD_KEY, { failures: FREE_ATTEMPTS, lockedUntil: null, lockedAt: null });
+    await guard.registerFailure();
+    expect(guard.monotonicRemainingMs()).toBeGreaterThan(0);
+
+    await guard.reset();
+    expect(guard.monotonicRemainingMs()).toBe(0);
+    await expect(guard.assertAllowed()).resolves.toBeUndefined();
+  });
+
+  it('still reads a record written before lockedAt existed', async () => {
+    const guard = new UnlockGuard();
+    // No `lockedAt` key at all, the shape shipped by the previous build.
+    localStore.set(GUARD_KEY, { failures: FREE_ATTEMPTS + 1, lockedUntil: Date.now() + 5_000 });
+    await expectCode(guard.assertAllowed(), 'UNLOCK_THROTTLED');
   });
 });

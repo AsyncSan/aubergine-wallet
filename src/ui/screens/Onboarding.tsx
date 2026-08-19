@@ -21,6 +21,7 @@ import {
   normalizeMnemonic,
   validateMnemonic,
 } from '../../core/crypto/mnemonic';
+import { shuffled } from '../../core/crypto/random';
 import {
   MIN_PASSWORD_SCORE,
   estimatePasswordStrength,
@@ -71,16 +72,20 @@ function StrengthMeter({ password }: { password: string }): ReactNode {
   );
 }
 
-/** Three distinct positions (0-based), ascending, out of a 12-word phrase. */
+/**
+ * Three distinct positions (0-based), ascending, out of a 12-word phrase.
+ *
+ * `shuffled` draws from `crypto.getRandomValues`, not `Math.random`. Which
+ * words the quiz asks for is not key material and a predictable draw would
+ * weaken nothing here, the user has just been shown the whole phrase. It is a
+ * CSPRNG anyway because a wallet that greps clean for `Math.random` costs one
+ * import, and the alternative is explaining these two lines to every reviewer.
+ */
 function pickQuizPositions(): number[] {
   const pool = Array.from({ length: 12 }, (_, i) => i);
-  for (let i = pool.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const a = pool[i] as number;
-    pool[i] = pool[j] as number;
-    pool[j] = a;
-  }
-  return pool.slice(0, QUIZ_COUNT).sort((x, y) => x - y);
+  return shuffled(pool)
+    .slice(0, QUIZ_COUNT)
+    .sort((x, y) => x - y);
 }
 
 export function Onboarding({
@@ -117,16 +122,10 @@ export function Onboarding({
   const [verifyError, setVerifyError] = useState(false);
 
   /** All 12 words, shuffled once; the tappable chips. */
-  const chips = useMemo(() => {
-    const shuffled = words.map((word, index) => ({ word, index }));
-    for (let i = shuffled.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      const a = shuffled[i] as { word: string; index: number };
-      shuffled[i] = shuffled[j] as { word: string; index: number };
-      shuffled[j] = a;
-    }
-    return shuffled;
-  }, [words]);
+  const chips = useMemo(
+    () => shuffled(words.map((word, index) => ({ word, index }))),
+    [words],
+  );
 
   function handleError(err: unknown): void {
     // Includes the typed timeout, so a wedged background says "took too long"

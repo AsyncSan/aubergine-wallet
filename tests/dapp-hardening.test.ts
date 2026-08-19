@@ -332,3 +332,98 @@ describe('SEP-29 memo flag comes from the real Horizon encoding', () => {
     expect(memoRequiredFromData({})).toBe(false);
   });
 });
+
+/* ------------------------------------------------- the unlock-state oracle */
+
+/**
+ * `isConnected` was hardened to stop reporting the lock state, because that
+ * handed every page in the browser a free "is this wallet unlocked right now?"
+ * probe: the targeting signal a phishing page wants most, and one a dApp has
+ * no legitimate use for. The same oracle was still reachable through the other
+ * two page-facing methods, which ran `requireUnlocked()` *before* they looked
+ * at whether the origin was approved at all.
+ *
+ * The rule these tests pin down: an origin the user has **not** approved must
+ * get the same answer whether the wallet is locked or unlocked. An origin the
+ * user **has** approved is a different matter, it receives the public key, so
+ * it necessarily learns the wallet is open.
+ */
+describe('an unapproved origin cannot tell a locked wallet from an unlocked one', () => {
+  it('answers dapp.signXdr identically in both states, with no prompt either way', async () => {
+    const { ctx, publicKey } = await walletInDeveloperMode();
+    const xdr = paymentXdr(publicKey);
+
+    const unlocked = await handlers['dapp.signXdr'](ctx, { origin: EVIL, xdr }).catch(
+      (err: unknown) => err,
+    );
+    expect(unlocked).toMatchObject({ code: 'USER_REJECTED' });
+    // Refused outright: an unapproved origin must not be able to spend the
+    // user's attention either, and no prompt means the caps never apply.
+    expect(ctx.prompts.pending).toBeNull();
+
+    ctx.keyring.lock();
+    const locked = await handlers['dapp.signXdr'](ctx, { origin: EVIL, xdr }).catch(
+      (err: unknown) => err,
+    );
+    expect(locked).toMatchObject({ code: 'USER_REJECTED' });
+    expect(ctx.prompts.pending).toBeNull();
+
+    // The point of the test: byte-for-byte the same verdict in both states.
+    expect((locked as { code: string }).code).toBe((unlocked as { code: string }).code);
+  });
+
+  it('sends dapp.requestConnect to the prompt even while the wallet is locked', async () => {
+    const { ctx } = await walletInDeveloperMode();
+    ctx.keyring.lock();
+
+    const connecting = handlers['dapp.requestConnect'](ctx, { origin: EVIL }).catch(
+      (err: unknown) => err,
+    );
+    // A prompt appearing at all is the assertion: the old code threw
+    // WALLET_LOCKED here, instantly and before any human was involved.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(ctx.prompts.pending).not.toBeNull();
+    expect(ctx.prompts.pending?.origin).toBe(EVIL);
+
+    await answerPrompt(ctx, false);
+    expect(await connecting).toMatchObject({ approved: false, publicKey: null });
+  });
+
+  it('never grants an origin that was approved while the wallet was locked', async () => {
+    const { ctx } = await walletInDeveloperMode();
+    ctx.keyring.lock();
+
+    const connecting = handlers['dapp.requestConnect'](ctx, { origin: EVIL }).catch(
+      (err: unknown) => err,
+    );
+    await answerPrompt(ctx, true);
+
+    // Approving is not enough; the key can only come from an unlocked keyring.
+    expect(await connecting).toMatchObject({ code: 'WALLET_LOCKED' });
+    const settings = await handlers['settings.get'](ctx, {});
+    expect(settings.allowedOrigins).not.toContain(EVIL);
+  });
+});
+
+describe('an approved origin still meets the lock', () => {
+  it('refuses dapp.signXdr with WALLET_LOCKED, not with a signature', async () => {
+    const { ctx, publicKey } = await walletInDeveloperMode();
+    const xdr = paymentXdr(publicKey);
+    ctx.keyring.lock();
+
+    await expect(handlers['dapp.signXdr'](ctx, { origin: ORIGIN, xdr })).rejects.toMatchObject({
+      code: 'WALLET_LOCKED',
+    });
+    expect(ctx.prompts.pending).toBeNull();
+  });
+
+  it('refuses dapp.requestConnect with WALLET_LOCKED and asks nobody', async () => {
+    const { ctx } = await walletInDeveloperMode();
+    ctx.keyring.lock();
+
+    await expect(handlers['dapp.requestConnect'](ctx, { origin: ORIGIN })).rejects.toMatchObject({
+      code: 'WALLET_LOCKED',
+    });
+    expect(ctx.prompts.pending).toBeNull();
+  });
+});

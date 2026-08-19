@@ -15,6 +15,7 @@
 import { z } from 'zod';
 import { AppError, ERROR_CODES } from '../core/errors';
 import { accountMetaSchema } from '../core/keyring/account';
+import { MIN_PASSWORD_SCORE, estimatePasswordStrength } from '../core/password-strength';
 import { httpsEndpointSchema, settingsPatchSchema, settingsSchema } from '../core/settings';
 import { checkSorobanEndpoint } from '../core/stellar/networks';
 import { MEMO_TEXT_MAX_BYTES, isValidMemoText } from '../core/stellar/memo';
@@ -109,10 +110,29 @@ const txDescriptionSchema = z.object({
 
 const emptySchema = z.object({});
 
+/**
+ * The password a *new* vault is created with (`wallet.create`,
+ * `wallet.importMnemonic`). Not used by `wallet.unlock` / `account.add` /
+ * `wallet.revealRecoveryPhrase`: those verify an existing password, and a
+ * strength rule applied there would lock an early adopter out of their own
+ * wallet.
+ *
+ * The strength floor is enforced *here*, at the edge, and not only by the
+ * Continue button in `ui/screens/Onboarding.tsx`. `core/password-strength`
+ * documents why the 8-character floor is not enough on its own, the keystore
+ * blob can be taken and ground offline against Argon2id, which buys ~15-20
+ * bits and no more, so the password has to carry the rest. A rule that lives
+ * only in a `disabled` attribute is a suggestion; the vault is created in the
+ * background, and this is the boundary the background actually checks.
+ */
 const passwordSchema = z
   .string()
   .min(8, 'password must be at least 8 characters')
-  .max(256);
+  .max(256)
+  .refine(
+    (value) => estimatePasswordStrength(value).score >= MIN_PASSWORD_SCORE,
+    'password is too easy to guess',
+  );
 
 /**
  * Developer-mode fee override, stroops **per operation**, as

@@ -1155,12 +1155,26 @@ export const handlers: HandlerMap = {
   'dapp.requestConnect': async (ctx, params) => {
     const settings = await ctx.settings();
     if (settings.mode !== 'developer') throw new AppError('DEVELOPER_MODE_REQUIRED');
-    const keyring = ctx.requireUnlocked();
     const origin = normalizeOrigin(params.origin);
-    const index = await ctx.selectedIndex();
 
+    /**
+     * The lock check comes *after* the approval check, deliberately.
+     *
+     * `requireUnlocked()` used to run first, which handed every page in the
+     * browser the oracle that `isConnected` was hardened to remove
+     * (`entrypoints/background.ts`): an unapproved origin got WALLET_LOCKED
+     * while locked and a prompt while unlocked, so polling `getPublicKey()`
+     * on a timer told a hostile page the exact moment the user unlocked their
+     * wallet, the targeting signal a phishing page wants most.
+     *
+     * An origin the user has already approved is a different matter: it needs
+     * the public key, so it necessarily learns the wallet is unlocked. An
+     * origin the user has *not* approved reaches the prompt either way and
+     * learns nothing without a human acting.
+     */
     if (settings.allowedOrigins.includes(origin)) {
-      return { approved: true, publicKey: keyring.publicKeyOf(index) };
+      const keyring = ctx.requireUnlocked();
+      return { approved: true, publicKey: keyring.publicKeyOf(await ctx.selectedIndex()) };
     }
     const approved = await ctx.prompts.ask('connect', origin, null);
     if (!approved) return { approved: false, publicKey: null };
@@ -1176,7 +1190,7 @@ export const handlers: HandlerMap = {
     const current = await ctx.settings();
     // The preconditions have to hold *now*, not when the page asked.
     if (current.mode !== 'developer') throw new AppError('DEVELOPER_MODE_REQUIRED');
-    ctx.requireUnlocked();
+    const keyring = ctx.requireUnlocked();
     if (!current.allowedOrigins.includes(origin)) {
       await ctx.updateSettings(
         mergeSettings(current, { allowedOrigins: [...current.allowedOrigins, origin] }),
@@ -1188,9 +1202,19 @@ export const handlers: HandlerMap = {
   'dapp.signXdr': async (ctx, params) => {
     const settings = await ctx.settings();
     if (settings.mode !== 'developer') throw new AppError('DEVELOPER_MODE_REQUIRED');
-    const keyring = ctx.requireUnlocked();
     const origin = normalizeOrigin(params.origin);
+    /**
+     * Refused before the lock state is ever consulted, and before any work is
+     * done. The old order (`requireUnlocked()` first) meant an unapproved
+     * origin got WALLET_LOCKED while locked and USER_REJECTED while unlocked,
+     * both instantly, with no prompt, no badge and nothing the user could
+     * see, and outside the prompt-queue caps because no prompt was ever
+     * queued. A page could poll this on a timer and watch for the moment the
+     * wallet came unlocked. Same oracle `isConnected` was hardened against,
+     * reached through a different method.
+     */
     if (!settings.allowedOrigins.includes(origin)) throw new AppError('USER_REJECTED');
+    const keyring = ctx.requireUnlocked();
 
     const network = await ctx.network();
     const parsedIncoming = TransactionBuilder.fromXDR(params.xdr, network.passphrase);

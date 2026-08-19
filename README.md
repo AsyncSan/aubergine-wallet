@@ -151,11 +151,22 @@ Two things worth knowing while comparing the build to the upload:
 
 1. **`.env.local` is required to get an identical build.** `WXT_SOROSWAP_API_KEY`
    is inlined at build time, so a build without it differs from the uploaded
-   package in exactly that one string. The value is not a secret: it is
-   readable in the published package by design, it authenticates this
-   extension against the Soroswap quote API and nothing else, and it carries
-   no user data. It is supplied in the reviewer notes of the submission.
-2. **`npm test` runs the full suite** (695 unit tests, no network) if you want
+   package in exactly that one string. It is supplied in the reviewer notes of
+   the submission.
+
+   To be precise about what that key is, because "not a secret" would be too
+   glib: it is a **shared service credential, deliberately shipped and
+   extractable**, identical in every install. It authenticates this extension
+   against the Soroswap quote API, carries no user data, and is rotatable by
+   us at any time. It is not a capability over anyone's funds. Whoever holds
+   it can spend our quota with the aggregator and nothing else — in
+   particular, an attacker who holds the key (or who *is* the aggregator)
+   still cannot cause a signature: every envelope the aggregator returns is
+   checked against the quote the user was shown before it can be signed
+   (`verifySoroswapEnvelope` in `src/core/stellar/soroswap.ts`, once on
+   receipt and again after RPC preparation, because preparation rewrites the
+   fee and copies the server's own `auth` entries into the operation).
+2. **`npm test` runs the full suite** (720 unit tests, no network) if you want
    to see the behaviour the code claims. `npx addons-linter <zip>` reports 0
    errors and 2 warnings. Both warnings are `UNSAFE_VAR_ASSIGNMENT` on
    `innerHTML` inside the bundled React DOM runtime, in its
@@ -186,7 +197,7 @@ of a source archive.
 
 ```bash
 npx tsc --noEmit    # TypeScript 5 strict
-npm test            # Vitest, 675 unit tests across 36 files
+npm test            # Vitest, 720 unit tests across 38 files
 npm run test:e2e    # Playwright against the built Chrome artifact
 npm run test:testnet # integration run against the real test network
 npm run test:mainnet # read-only integration run against the main network
@@ -242,6 +253,17 @@ Key derivation is Argon2id at 64 MiB over 3 passes, with PBKDF2-SHA-512 at
 AES-256-GCM. Unlocking is throttled after four failed attempts, growing
 exponentially to a 30 minute ceiling, and the counter survives a browser
 restart.
+
+The lockout deadline is a wall-clock instant, and the system clock belongs to
+whoever is at the machine, so the throttle does not simply believe it. Winding
+the clock backwards is detected and costs the full delay again from the new
+reading. Winding it forwards is overridden by a `performance.now()` anchor for
+as long as the service worker lives. What remains open, and cannot be closed by
+an extension: a forward jump *combined with* a worker restart, because MV3
+discards the anchor and nothing readable from an extension is both monotonic
+and durable across that. An attacker who manages it is back to one guess per
+Argon2id derivation with the failure counter still climbing, which is the floor
+this throttle ever promised.
 
 ### Zeroization: what actually holds
 
