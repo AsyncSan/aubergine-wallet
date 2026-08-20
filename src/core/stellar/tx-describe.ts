@@ -19,6 +19,11 @@ import {
   type Memo,
   type MemoType,
 } from '@stellar/stellar-sdk';
+import {
+  describeInvokeHostFunction,
+  foreignAuthContracts,
+  type SorobanInvocation,
+} from './soroban-describe';
 
 /**
  * The discriminated union of *decoded* operations. `Operation` at the package
@@ -47,6 +52,9 @@ export const WARNING_CODES = [
   'NETWORK_MISMATCH',
   'FOREIGN_SOURCE_ACCOUNT',
   'SOROBAN_INVOCATION',
+  'SOROBAN_AUTH_FOREIGN_CONTRACT',
+  'SOROBAN_AUTH_THIRD_PARTY',
+  'SOROBAN_PARTIAL_DECODE',
   'MAINNET_REAL_FUNDS',
   'MEMO_REQUIRED',
   'HIGH_FEE',
@@ -111,6 +119,12 @@ export interface TxDescription {
   readonly meta: TxMeta;
   /** False when at least one operation could not be rendered in plain language. */
   readonly translatable: boolean;
+  /**
+   * One entry per `invokeHostFunction` operation, decoded down to the contract
+   * id, the function symbol and the arguments. Empty for every envelope that
+   * does not touch Soroban, which is the common case.
+   */
+  readonly invocations: readonly SorobanInvocation[];
 }
 
 /** Slippage quote the wallet obtained itself, per operation index. */
@@ -251,6 +265,7 @@ function networkTerm(name: string | undefined, fallback: string): string {
 class DescriptionBuilder {
   readonly effects: Effect[] = [];
   readonly warnings: Warning[] = [];
+  readonly invocations: SorobanInvocation[] = [];
   private readonly seenWarnings = new Set<string>();
   translatable = true;
 
@@ -693,9 +708,83 @@ function describeOperation(
     }
     case 'invokeHostFunction': {
       b.warn('SOROBAN_INVOCATION', 'warn', 'tx.warn.SOROBAN_INVOCATION', undefined, index);
-      b.effect(index, op.type, 'tx.op.invokeHostFunction', {
-        kind: describeHostFunctionKind(op),
-      });
+      const invocation = describeInvokeHostFunction(op, index);
+      b.invocations.push(invocation);
+
+      /**
+       * The operation line now names what is actually being called. It used to
+       * read "Call a smart contract (call a function)" for every contract call
+       * in existence, which is a sentence that cannot distinguish a swap from
+       * an unbounded token approval, i.e. exactly the distinction the
+       * confirmation exists to make.
+       */
+      if (invocation.kind === 'invoke' && invocation.call !== null) {
+        b.effect(index, op.type, 'tx.op.invokeContract', {
+          fn: invocation.call.functionName,
+          contract: shortAddress(invocation.call.contractId),
+        });
+      } else if (invocation.kind === 'uploadWasm') {
+        b.effect(index, op.type, 'tx.op.uploadWasm', {
+          bytes: invocation.wasmByteLength ?? 0,
+        });
+      } else if (invocation.kind === 'createContract') {
+        b.effect(index, op.type, 'tx.op.createContract', {
+          executable: invocation.executableKey ?? 'tx.term.executable.unknown',
+        });
+      } else {
+        b.effect(index, op.type, 'tx.op.invokeHostFunction', {
+          kind: describeHostFunctionKind(op),
+        });
+      }
+
+      /**
+       * The auth tree is where a contract call keeps the part it does not say
+       * out loud. Two things in it are worth a sentence of their own.
+       */
+      const foreign = foreignAuthContracts(invocation);
+      if (foreign.length > 0) {
+        b.warn(
+          'SOROBAN_AUTH_FOREIGN_CONTRACT',
+          'warn',
+          'tx.warn.SOROBAN_AUTH_FOREIGN_CONTRACT',
+          { count: foreign.length, contracts: foreign.map(shortAddress).join(', ') },
+          index,
+        );
+      }
+      /**
+       * `sorobanCredentialsAddress` means a party other than the signer has to
+       * authorise part of this call. Benign in a co-signed flow, and the shape
+       * a transaction takes when it was assembled to spend *someone else's*
+       * authorisation — so the user is told which address, not whether to
+       * worry.
+       */
+      const thirdParty = invocation.auth
+        .filter((entry) => entry.credential === 'address' && entry.address !== '')
+        .map((entry) => entry.address);
+      if (thirdParty.length > 0) {
+        b.warn(
+          'SOROBAN_AUTH_THIRD_PARTY',
+          'info',
+          'tx.warn.SOROBAN_AUTH_THIRD_PARTY',
+          { addresses: Array.from(new Set(thirdParty)).join(', ') },
+          index,
+        );
+      }
+      /**
+       * Fail-closed, softly: a partial decode does not block the signature the
+       * way an untranslatable *operation* does, because the operation itself is
+       * understood. It says so rather than presenting the fragment it managed
+       * to read as the whole story.
+       */
+      if (invocation.partial) {
+        b.warn(
+          'SOROBAN_PARTIAL_DECODE',
+          'warn',
+          'tx.warn.SOROBAN_PARTIAL_DECODE',
+          undefined,
+          index,
+        );
+      }
       return;
     }
     case 'extendFootprintTtl': {
@@ -729,10 +818,20 @@ function describeOperation(
 export function describeOperations(
   ops: readonly SdkOperation[],
   ctx: DescribeContext,
-): { effects: readonly Effect[]; warnings: readonly Warning[]; translatable: boolean } {
+): {
+  effects: readonly Effect[];
+  warnings: readonly Warning[];
+  translatable: boolean;
+  invocations: readonly SorobanInvocation[];
+} {
   const b = new DescriptionBuilder();
   ops.forEach((op, index) => describeOperation(b, ctx, op, index));
-  return { effects: b.effects, warnings: b.warnings, translatable: b.translatable };
+  return {
+    effects: b.effects,
+    warnings: b.warnings,
+    translatable: b.translatable,
+    invocations: b.invocations,
+  };
 }
 
 const HOST_FUNCTION_TERMS: Readonly<Record<string, string>> = {
@@ -801,6 +900,7 @@ function unparseable(xdr: string, ctx: DescribeContext, detail: string): TxDescr
     ],
     raw: xdr,
     translatable: false,
+    invocations: [],
     meta: {
       network: ctx.networkPassphrase,
       networkName: ctx.networkName ?? '',
@@ -929,6 +1029,7 @@ export function describeTransaction(xdr: string, ctx: DescribeContext): TxDescri
     warnings: b.warnings,
     raw: xdr,
     translatable: b.translatable,
+    invocations: b.invocations,
     meta: {
       network: ctx.networkPassphrase,
       networkName: ctx.networkName ?? '',

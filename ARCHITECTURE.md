@@ -121,7 +121,13 @@ Arbeit ohne Konflikte garantiert.
    entsperrt.
 9. Passwort-Gate (v1.3): Onboarding verlangt für Create **und** Import einen Mindest-Score
    (`MIN_PASSWORD_SCORE = 2`) aus dem entropiebasierten Estimator in `core/password-strength.ts`
-   (dependency-frei, bewusst kein zxcvbn, Bundle- und Supply-Chain-Kosten).
+   (dependency-frei, bewusst kein zxcvbn, Bundle- und Supply-Chain-Kosten). Die Regel lebt
+   **nicht nur** im `disabled`-Attribut des Continue-Buttons, sondern im `passwordSchema` in
+   `messaging/protocol.ts`, also an der Grenze, die der Background tatsächlich prüft. Eine
+   Ablehnung dort ist ein `WEAK_PASSWORD` (Längen-Grenzen: `BAD_REQUEST`), kein `ZodError`,
+   sonst käme sie nach §6 als `INTERNAL_ERROR` in der UI an. Verifikation eines **bestehenden**
+   Passworts (`wallet.unlock`, `account.add`, `wallet.revealRecoveryPhrase`) bekommt die Regel
+   bewusst nicht: sie würde frühe Nutzer aus der eigenen Wallet aussperren.
 
 **Bedrohungsmodell, das Phase 1 abdeckt:** bösartige Webseite, Phishing-dApp, Diebstahl der
 Extension-Storage-Datei bei gesperrtem Wallet, versehentliche Fehlsignierung durch unklares UI.
@@ -206,6 +212,85 @@ Empfänger-Konto existiert nicht (→ Mindestreserve fällig) · `sequence`-Spru
 Für jede Warnung existiert ein DE- und EN-Text. **Unbekannte Operation ⇒ Fail-closed:**
 Warnung „Diese Operation können wir nicht in Klartext übersetzen" statt stiller Durchreiche.
 
+### 1.1 Passkey-Entsperrung (`core/crypto/passkey.ts`, 20.08.2026)
+
+**Additiv, nicht ersetzend.** Der Keystore aus §1 bleibt Byte für Byte, was er war. Danebengelegt
+wird ein zweiter Datensatz (`passkey.v1`), der einen zufälligen **Vault-Key** zweimal verpackt:
+einmal mit dem passwortabgeleiteten Schlüssel (gewöhnliches Keystore-Blob), einmal mit
+HKDF-SHA-256 über die **PRF-Ausgabe** des Authenticators. Der Vault liegt unter diesem Vault-Key.
+Beide Wege öffnen; keiner lässt sich aus dem anderen berechnen. Geht hier irgendetwas kaputt,
+kostet das eine Neueinrichtung — nicht die Wallet.
+
+**PRF oder gar nichts.** Ein Passkey ohne die `prf`-Erweiterung *bestätigt* nur Anwesenheit; er
+erzeugt kein Schlüsselmaterial. Ihn trotzdem zum Entsperren zu benutzen hieße, das Entsperr-
+geheimnis irgendwo abzulegen, wo die Assertion es erreicht — in einer Extension also in
+`storage.local`, direkt neben dem Ciphertext, den es schützen soll. Das ist keine Verschlüsselung,
+sondern ein Schloss mit angeklebtem Schlüssel. Kann der Authenticator kein PRF, bietet diese
+Wallet gar keine Passkey-Entsperrung an und sagt das auch.
+
+**Das PRF-Salt ist ein lokales Geheimnis.** WebAuthn bindet ein Credential an eine RP-ID, und eine
+Extension darf nur eine RP-ID beanspruchen, für die sie eine Host-Berechtigung hält — also die
+eigene Domain. Ein Skript auf `aubergine.tech` könnte denselben Authenticator dasselbe PRF
+auswerten lassen und bekäme bei *bekanntem* Salt exakt unseren Wrapping-Schlüssel. Das Salt sind
+deshalb 32 Zufallsbytes aus der Einrichtung, die nur im Extension-Storage liegen: wer sie lesen
+kann, liest den Ciphertext daneben ohnehin.
+
+`https://aubergine.tech/*` steht in `optional_host_permissions`, nicht in `host_permissions` — die
+Installation bleibt sauber, die Berechtigung wird aus dem Klick angefragt, der das Feature
+einschaltet. Das Einrichten verlangt zusätzlich das Passwort: einen zweiten Schlüssel zur Wallet
+darf nur hinzufügen, wer den ersten hat.
+
+**Kein Throttle auf dem Passkey-Pfad.** Die Bremse in `unlock-guard.ts` verteuert *Raten*, und an
+32 Byte PRF-Ausgabe eines Authenticators, der vorher User-Verification verlangt hat, ist nichts zu
+raten. Würde sie hier zählen, könnte ein veralteter Datensatz die Versuche aufbrauchen, die der
+Nutzer für das Passwort braucht — den Weg, der noch funktioniert.
+
+`persistVault()` ist die einzige Stelle, die vom Passkey weiß: sie holt den Vault-Key aus dem
+*Passwort*-Wrapper und schreibt die Passkey-Kopie mit, damit `account.add` niemandem mitten in
+einer unbeteiligten Aktion einen Fingerabdruck abverlangt. Best effort und *nach* dem
+Keystore-Schreiben, damit ein Fehler dort nie ein erfolgreiches `account.add` in einen Fehlschlag
+verwandelt. Tests: `tests/passkey.test.ts`.
+
+Bekannte Grenze: Firefox schließt das Extension-Popup, sobald die Credential-Abfrage erscheint
+(bugzil.la/2026687). Die Wallet erkennt das und bietet an, sich vorher in einem Tab zu öffnen,
+statt den Nutzer einen stillen Fehlschlag entdecken zu lassen.
+
+---
+
+### 5.1 Soroban-Aufrufe (`core/stellar/soroban-describe.ts`, 20.08.2026)
+
+Die Modus-Tabelle in §4 versprach für den Entwickler-Modus „erlaubt, mit Argument-Dekodierung".
+Dekodiert wurde bis hierher nichts: jeder Contract-Aufruf, den es je gab, erzeugte dieselbe Zeile
+„Smart Contract aufrufen (Funktion aufrufen)". Genau die Unterscheidung, für die die Bestätigung
+existiert — ein Swap gegen eine Token-Freigabe mit unbegrenztem Allowance an eine fremde Adresse —
+war damit nicht möglich, und für eine Wallet, deren gesamtes Versprechen die Klartextvorschau ist,
+war das die teuerste Lücke im Produkt.
+
+`describeInvokeHostFunction()` liest aus dem Envelope, das der Nutzer ohnehin schon hält:
+Contract-ID, Funktionssymbol, jedes Argument mit Anzeigetyp (`tx.scv.*`), bei `createContract`
+das Executable und den WASM-Hash, bei `uploadContractWasm` die Größe. Dazu den **Autorisierungs-
+baum** jedes `SorobanAuthorizationEntry`, breitensuchend abgeflacht, mit Tiefe je Knoten.
+
+Drei Grenzen, die keine Implementierungsdetails sind, sondern die Entwurfsentscheidung:
+
+- **Kein Netzwerkzugriff, keine Contract-Spec, kein ABI, kein Token-Symbol.** Ein Abruf pro
+  Bestätigung an einen Endpunkt, den der Ersteller der Transaktion aussucht, wäre ein Orakel für
+  „dieser Nutzer signiert gerade" — §3 und §4 schließen das aus.
+- **Keine Semantik.** `transfer` wird als Symbol `transfer` gerendert, weil das in den Bytes steht.
+  Das Modul behauptet nie zu wissen, dass eine so benannte Funktion etwas überträgt.
+- **Harte Schranken** auf Tiefe, Anzahl und Länge jedes gerenderten Werts. Argumente sind
+  angreiferkontrollierte Daten in einem 360-px-Popup; ohne Deckel schiebt ein 2-MB-`scvString` den
+  Bestätigen-Knopf aus dem Bild und ein Nutzer signiert, damit der Dialog verschwindet.
+
+Neue Warnungen: `SOROBAN_AUTH_FOREIGN_CONTRACT` (die Unterschrift deckt Contracts ab, die die
+Zusammenfassung nicht nennt — die Drainer-Form), `SOROBAN_AUTH_THIRD_PARTY` (ein Teil wird von
+einer fremden Adresse freigegeben), `SOROBAN_PARTIAL_DECODE` (fail-closed, weich: das Fragment
+wird nicht als vollständige Lesart präsentiert).
+
+Der Abschnitt wird in **beiden** Modi gerendert, anders als XDR-Disclosure und Reserve-Aufschlüsselung.
+Wer im Einsteiger-Modus überhaupt vor diesem Dialog steht, soll gerade nicht die wenigsten
+Informationen bekommen. Tests: `tests/soroban-describe.test.ts`.
+
 ---
 
 ## 6. Nachrichtenprotokoll (die harte Schnittstelle zwischen den Kontexten)
@@ -222,8 +307,17 @@ settings.get | settings.set
 ```
 
 Fehler werden als typisierte Codes zurückgegeben (`WALLET_LOCKED`, `BAD_PASSWORD`,
-`USER_REJECTED`, `NETWORK_ERROR`, `TX_FAILED:<result_code>`), nie als rohe Exception-Strings,
-damit die UI sie übersetzen kann.
+`WEAK_PASSWORD`, `USER_REJECTED`, `NETWORK_ERROR`, `TX_FAILED:<result_code>`), nie als rohe
+Exception-Strings, damit die UI sie übersetzen kann.
+
+Konsequenz für Validierung an der Grenze: eine Schema-Regel, die eine **fachliche** Ablehnung
+ausdrückt, wirft einen `AppError` aus einem `.transform`, keinen `ZodError` aus einem
+`.refine`. `toWireError` erhält `.code` nur für `AppError`; ein roher `ZodError` fällt auf
+`INTERNAL_ERROR` zurück und die UI zeigt „ein unerwarteter Fehler ist aufgetreten" für etwas,
+das in Wahrheit „das ist keine Gebühr" oder „dieses Passwort ist zu leicht zu erraten" heißt.
+So gebaut: `passwordSchema`, `feeOverrideSchema`, `sorobanRpcOverrideParamSchema`. Jeder Code
+braucht einen Eintrag in **beiden** Katalogen (`i18n/en.json`, `i18n/de.json`), `i18n.test.ts`
+erzwingt das.
 
 Der injizierte Webseiten-Provider (`window.aubergine`) folgt der Freighter-artigen Signatur
 (`isConnected`, `getPublicKey`, `signTransaction`, `getNetwork`), damit bestehende Stellar-dApps

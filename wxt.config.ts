@@ -73,6 +73,15 @@ export default defineConfig({
       'https://horizon-futurenet.stellar.org/*',
       'https://rpc-futurenet.stellar.org/*',
       'https://friendbot-futurenet.stellar.org/*',
+      /**
+       * Not a network endpoint: this is the WebAuthn relying-party ID for
+       * passkey unlock. Chrome 122+/Firefox 150+ only let an extension claim
+       * an RP ID for a domain it holds a host permission for, and
+       * `chrome-extension://` cannot be one. Optional, so nobody pays for it
+       * at install; requested from the click that enables the feature. See
+       * `src/core/crypto/passkey.ts`.
+       */
+      'https://aubergine.tech/*',
       // The dApp connector's web access; developer mode only, requested from
       // a user gesture. Mirrors `DAPP_CONNECTOR_ORIGINS` in
       // `src/core/stellar/networks.ts` — `http://*/*` was dropped there on

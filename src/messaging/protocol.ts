@@ -76,6 +76,46 @@ const historyEntrySchema = z.object({
   assetCode: z.string().nullable(),
 });
 
+/**
+ * The decoded Soroban call, mirroring `core/stellar/soroban-describe`.
+ *
+ * Declared here as well because everything crossing the port is re-validated
+ * on arrival (§6): the popup must not trust a shape just because the
+ * background is the only thing that is supposed to be sending it.
+ */
+const scArgSchema = z.object({
+  typeKey: z.string(),
+  value: z.string(),
+  truncated: z.boolean(),
+});
+
+const sorobanCallSchema = z.object({
+  contractId: z.string(),
+  functionName: z.string(),
+  args: z.array(scArgSchema),
+  argsOmitted: z.number(),
+});
+
+const sorobanAuthEntrySchema = z.object({
+  credential: z.enum(['sourceAccount', 'address', 'unknown']),
+  address: z.string(),
+  invocations: z.array(
+    z.object({ contractId: z.string(), functionName: z.string(), depth: z.number() }),
+  ),
+  nodesOmitted: z.number(),
+});
+
+const sorobanInvocationSchema = z.object({
+  opIndex: z.number(),
+  kind: z.enum(['invoke', 'createContract', 'uploadWasm', 'unknown']),
+  call: sorobanCallSchema.nullable(),
+  executableKey: z.string().nullable(),
+  wasmHash: z.string().nullable(),
+  wasmByteLength: z.number().nullable(),
+  auth: z.array(sorobanAuthEntrySchema),
+  partial: z.boolean(),
+});
+
 const txDescriptionSchema = z.object({
   summary: i18nMessageSchema,
   effects: z.array(
@@ -91,6 +131,7 @@ const txDescriptionSchema = z.object({
   ),
   raw: z.string(),
   translatable: z.boolean(),
+  invocations: z.array(sorobanInvocationSchema),
   meta: z.object({
     network: z.string(),
     networkName: z.string(),
@@ -124,15 +165,30 @@ const emptySchema = z.object({});
  * bits and no more, so the password has to carry the rest. A rule that lives
  * only in a `disabled` attribute is a suggestion; the vault is created in the
  * background, and this is the boundary the background actually checks.
+ *
+ * A refusal here is a `WEAK_PASSWORD` (or `BAD_REQUEST` for the length
+ * bounds), not a `ZodError`, so the caller learns *why* it was refused
+ * instead of reading "an unexpected error occurred".
  */
-const passwordSchema = z
-  .string()
-  .min(8, 'password must be at least 8 characters')
-  .max(256)
-  .refine(
-    (value) => estimatePasswordStrength(value).score >= MIN_PASSWORD_SCORE,
-    'password is too easy to guess',
-  );
+const passwordSchema = z.string().transform((value): string => {
+  // `AppError`s, not `ZodError`s, for the same reason `feeOverrideSchema`
+  // below throws one: §6 wants a code the popup can translate, and
+  // `toWireError` preserves `.code` only for `AppError`. A raw ZodError falls
+  // through to `INTERNAL_ERROR` -> "an unexpected error occurred", which tells
+  // the caller nothing and is indistinguishable from a real internal fault.
+  // The popup's Continue button covers the normal flow; this covers everyone
+  // else (a tampered popup, a non-UI RPC caller, the tests).
+  if (value.length < 8) {
+    throw new AppError('BAD_REQUEST', 'password must be at least 8 characters');
+  }
+  if (value.length > 256) {
+    throw new AppError('BAD_REQUEST', 'password must be at most 256 characters');
+  }
+  if (estimatePasswordStrength(value).score < MIN_PASSWORD_SCORE) {
+    throw new AppError('WEAK_PASSWORD', 'password is too easy to guess');
+  }
+  return value;
+});
 
 /**
  * Developer-mode fee override, stroops **per operation**, as
@@ -534,6 +590,53 @@ export const rpcSchemas = {
   'settings.acknowledgeMainnet': {
     params: z.object({ confirmation: z.literal('MAINNET') }),
     result: settingsSchema,
+  },
+
+  /* ------------------------------------------------------- passkey unlock */
+
+  /**
+   * What the popup needs in order to run a ceremony, and nothing more.
+   *
+   * `prfSalt` is a secret (see `core/crypto/passkey.ts`) and it is handed out
+   * *before* the wallet is unlocked, because that is exactly when the unlock
+   * ceremony has to run. That is not a widening: the popup and the background
+   * are the same extension with the same storage access, and the password
+   * already travels this same port.
+   */
+  'passkey.status': {
+    params: emptySchema,
+    result: z.object({
+      enrolled: z.boolean(),
+      credentialId: z.string().nullable(),
+      prfSalt: z.string().nullable(),
+    }),
+  },
+  /**
+   * Reserve a fresh PRF salt for an enrolment that has not happened yet.
+   *
+   * Generated in the background and *not* stored: a salt only becomes real in
+   * `passkey.enable`, so an abandoned ceremony leaves nothing behind.
+   */
+  'passkey.prepare': {
+    params: emptySchema,
+    result: z.object({ prfSalt: z.string() }),
+  },
+  'passkey.enable': {
+    params: z.object({
+      password: z.string().min(1),
+      credentialId: z.string().min(1),
+      prfSalt: z.string().min(1),
+      prfOutput: z.string().min(1),
+    }),
+    result: emptySchema,
+  },
+  'passkey.disable': {
+    params: emptySchema,
+    result: emptySchema,
+  },
+  'passkey.unlock': {
+    params: z.object({ prfOutput: z.string().min(1) }),
+    result: z.object({ accounts: z.array(publicAccountSchema) }),
   },
 } as const;
 

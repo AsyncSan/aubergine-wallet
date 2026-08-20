@@ -9,6 +9,16 @@ export const ERROR_CODES = [
   'WALLET_EXISTS',
   'NO_WALLET',
   'BAD_PASSWORD',
+  /**
+   * A password offered for a *new* vault does not clear the strength floor.
+   *
+   * Distinct from `BAD_PASSWORD` (an existing password that did not verify)
+   * and from `BAD_REQUEST` (a malformed message): this one is a refusal the
+   * caller can act on, so it gets its own translatable code rather than being
+   * folded into "that request was malformed". See `MIN_PASSWORD_SCORE` in
+   * `core/password-strength` for the calibration.
+   */
+  'WEAK_PASSWORD',
   'UNLOCK_THROTTLED',
   'MEMO_REQUIRED',
   'TOO_MANY_REQUESTS',
@@ -26,6 +36,18 @@ export const ERROR_CODES = [
   'SWAP_ENVELOPE_MISMATCH',
   'KEYSTORE_UNREADABLE',
   'PERMISSION_REQUIRED',
+  /**
+   * A passkey ceremony produced material that does not open this wallet.
+   *
+   * Distinct from `BAD_PASSWORD` and deliberately *not* counted by the unlock
+   * throttle: there is nothing to brute-force here. The PRF output is 32 bytes
+   * from an authenticator that already demanded user verification, so a wrong
+   * one means a foreign credential or a stale record, not a guessing attempt,
+   * and throttling it would only lock a user out of the password path too.
+   */
+  'PASSKEY_FAILED',
+  /** No passkey is enrolled on this installation. */
+  'PASSKEY_NOT_ENROLLED',
   'UNSUPPORTED_OPERATION',
   /**
    * A previous submission from this account has no known outcome yet, so

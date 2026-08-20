@@ -8,9 +8,17 @@
  */
 import { browser } from 'wxt/browser';
 import { keystoreSchema, type Keystore } from '../core/crypto/keystore';
+import { passkeyRecordSchema, type PasskeyRecord } from '../core/crypto/passkey';
 import { DEFAULT_SETTINGS, settingsSchema, type Settings } from '../core/settings';
 
 const KEYSTORE_KEY = 'keystore.v1';
+/**
+ * The passkey wrapper. A *separate* key on purpose: everything about passkey
+ * unlock is additive, and a corrupt or half-written record here must never be
+ * able to make `keystore.v1` unreadable. Losing this one costs a re-enrolment;
+ * losing that one costs the wallet.
+ */
+const PASSKEY_KEY = 'passkey.v1';
 /** Exported so the worker can tell a settings change apart from any other. */
 export const SETTINGS_KEY = 'settings.v1';
 
@@ -45,6 +53,31 @@ export async function clearKeystore(): Promise<void> {
 /** True for "something is stored here", readable or not; the overwrite guard. */
 export async function hasKeystore(): Promise<boolean> {
   return (await readKeystore()) !== null;
+}
+
+/**
+ * The passkey record, or null.
+ *
+ * Unlike the keystore there is no `unreadable` verdict here: a record we
+ * cannot parse is simply a passkey that no longer works, and the honest
+ * response is to offer the password, not to refuse the wallet. The record is
+ * left in place rather than deleted, so a bug in a future schema cannot
+ * silently destroy a user's enrolment.
+ */
+export async function readPasskeyRecord(): Promise<PasskeyRecord | null> {
+  const stored = await browser.storage.local.get(PASSKEY_KEY);
+  const raw = stored[PASSKEY_KEY];
+  if (raw === undefined || raw === null) return null;
+  const parsed = passkeyRecordSchema.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+
+export async function writePasskeyRecord(record: PasskeyRecord): Promise<void> {
+  await browser.storage.local.set({ [PASSKEY_KEY]: record });
+}
+
+export async function clearPasskeyRecord(): Promise<void> {
+  await browser.storage.local.remove(PASSKEY_KEY);
 }
 
 /** True only for a blob that is present and cannot be parsed. */

@@ -347,12 +347,29 @@ describe('the vault-creation password floor is enforced at the RPC edge', () => 
     return method === 'wallet.create' ? { password } : { password, mnemonic: MNEMONIC };
   }
 
+  /**
+   * The refusal is an `AppError` thrown out of the schema's `transform`, not a
+   * ZodError issue, so it escapes `safeParse` rather than being reported by
+   * it. That is the point: `toWireError` keeps the code only for `AppError`,
+   * and a ZodError would reach the popup as `INTERNAL_ERROR`. Asserting the
+   * *code* here is what stops that regression coming back.
+   */
+  function refusal(method: (typeof CREATION_METHODS)[number], password: string): AppError {
+    try {
+      rpcSchemas[method].params.parse(paramsFor(method, password));
+    } catch (err) {
+      return err as AppError;
+    }
+    throw new Error(`${password} was accepted by ${method}`);
+  }
+
   for (const method of CREATION_METHODS) {
     it(`${method} refuses a password long enough but trivially guessable`, () => {
       // Eight characters clears the length floor and nothing else.
       for (const weak of ['password', 'passwort', 'qwertzui', '12345678', 'aaaaaaaa']) {
-        const parsed = rpcSchemas[method].params.safeParse(paramsFor(method, weak));
-        expect(parsed.success, `${weak} was accepted`).toBe(false);
+        const err = refusal(method, weak);
+        expect(err, `${weak} was not refused with an AppError`).toBeInstanceOf(AppError);
+        expect(err.code, weak).toBe('WEAK_PASSWORD');
       }
     });
 
@@ -364,9 +381,20 @@ describe('the vault-creation password floor is enforced at the RPC edge', () => 
     });
 
     it(`${method} still refuses anything under eight characters`, () => {
-      expect(rpcSchemas[method].params.safeParse(paramsFor(method, 'Tr0ub4d')).success).toBe(
-        false,
-      );
+      const err = refusal(method, 'Tr0ub4d');
+      expect(err).toBeInstanceOf(AppError);
+      expect(err.code).toBe('BAD_REQUEST');
+    });
+
+    /**
+     * The whole reason the schema throws `AppError`: what the popup receives
+     * has to be the reason, not `INTERNAL_ERROR`.
+     */
+    it(`${method} surfaces the refusal as a translatable wire code`, () => {
+      const wire = toWireError(refusal(method, 'password'));
+      expect(wire.code).toBe('WEAK_PASSWORD');
+      expect(ERROR_CODES).toContain(wire.code);
+      expect(errorI18nKey(wire.code)).toBe('error.WEAK_PASSWORD');
     });
   }
 

@@ -7,7 +7,27 @@
  */
 import { TransactionBuilder, type Transaction } from '@stellar/stellar-sdk';
 import { AppError } from '../core/errors';
-import { KEYSTORE_VERSION, decryptJson, encryptJson } from '../core/crypto/keystore';
+import {
+  KEYSTORE_VERSION,
+  decryptJson,
+  decryptKeystore,
+  encryptJson,
+  encryptKeystore,
+  fromBase64,
+  toBase64,
+} from '../core/crypto/keystore';
+import {
+  PRF_SALT_BYTES,
+  PasskeyUnwrapError,
+  generateVaultKey,
+  openVault,
+  sealVault,
+  unwrapVaultKeyWithPrf,
+  wrapVaultKeyWithPrf,
+  type PasskeyRecord,
+} from '../core/crypto/passkey';
+import { randomBytes } from '../core/crypto/kdf';
+import { zeroize } from '../core/crypto/zeroize';
 import { generateMnemonic, normalizeMnemonic, validateMnemonic } from '../core/crypto/mnemonic';
 import { Keyring } from '../core/keyring/keyring';
 import { vaultSchema, type PublicAccount, type Vault } from '../core/keyring/account';
@@ -72,6 +92,9 @@ import {
 } from './dapp';
 import {
   clearKeystore,
+  clearPasskeyRecord,
+  readPasskeyRecord,
+  writePasskeyRecord,
   hasKeystore,
   keystoreIsUnreadable,
   readKeystore,
@@ -254,9 +277,43 @@ export class BackgroundContext {
     return index ?? (await this.selectedIndex());
   }
 
-  /** Persist the current vault under the given password. */
+  /**
+   * Persist the current vault under the given password.
+   *
+   * If a passkey is enrolled, the passkey copy is rewritten here too, and this
+   * is the only place in the wallet that has to know about it. The vault key
+   * is recovered from its *password* wrapper, so a vault mutation
+   * (`account.add`) never has to make the user touch a fingerprint reader in
+   * the middle of an unrelated action.
+   *
+   * The passkey rewrite is best effort and runs after the keystore write. Two
+   * consequences, both deliberate: a failure here can never turn a successful
+   * `account.add` into a failure, and if it does fail the passkey copy goes
+   * stale rather than wrong — it decrypts to a vault missing the newest
+   * account, which the next password unlock repairs. Losing the passkey is a
+   * re-enrolment; losing the keystore is the wallet.
+   */
   async persistVault(vault: Vault, password: string): Promise<void> {
-    await writeKeystore(await encryptJson(vaultSchema.parse(vault), password));
+    const parsed = vaultSchema.parse(vault);
+    await writeKeystore(await encryptJson(parsed, password));
+    try {
+      const record = await readPasskeyRecord();
+      if (record === null) return;
+      const vaultKey = await decryptKeystore(record.vaultKeyUnderPassword, password);
+      try {
+        await writePasskeyRecord({
+          ...record,
+          vaultUnderVaultKey: await sealVault(
+            new TextEncoder().encode(JSON.stringify(parsed)),
+            vaultKey,
+          ),
+        });
+      } finally {
+        zeroize(vaultKey);
+      }
+    } catch {
+      /* see the note above: never fail the caller for the secondary copy */
+    }
   }
 
   /**
@@ -382,6 +439,20 @@ function toWireDescription(description: TxDescription): RpcResult<'tx.describe'>
     ...description,
     effects: [...description.effects],
     warnings: [...description.warnings],
+    // Deep, not shallow: the invocation carries three nested readonly arrays
+    // (arguments, auth entries, the flattened auth tree) and each of them has
+    // to become a plain array to satisfy the wire schema.
+    invocations: description.invocations.map((invocation) => ({
+      ...invocation,
+      call:
+        invocation.call === null
+          ? null
+          : { ...invocation.call, args: [...invocation.call.args] },
+      auth: invocation.auth.map((entry) => ({
+        ...entry,
+        invocations: [...entry.invocations],
+      })),
+    })),
   };
 }
 
@@ -652,6 +723,9 @@ export const handlers: HandlerMap = {
     ctx.prompts.rejectAll();
     await ctx.autoLock.cancel();
     await clearKeystore();
+    // The passkey copy holds the same vault. Leaving it behind would keep a
+    // fully usable wallet on disk after the user asked for it to be gone.
+    await clearPasskeyRecord();
     // The keystore is gone, so the throttle protects nothing anymore; a stale
     // lockout would only confuse the next onboarding.
     await ctx.unlockGuard.reset();
@@ -1324,6 +1398,104 @@ export const handlers: HandlerMap = {
     }
     const next = mergeSettings(current, patch);
     return ctx.updateSettings(next);
+  },
+
+  /* ------------------------------------------------------- passkey unlock */
+
+  'passkey.status': async () => {
+    const record = await readPasskeyRecord();
+    return record === null
+      ? { enrolled: false, credentialId: null, prfSalt: null }
+      : { enrolled: true, credentialId: record.credentialId, prfSalt: record.prfSalt };
+  },
+
+  'passkey.prepare': async () => ({ prfSalt: toBase64(randomBytes(PRF_SALT_BYTES)) }),
+
+  /**
+   * Turn the ceremony's PRF output into a second way into the vault.
+   *
+   * The password is required and verified here (via `loadVault`, the throttled
+   * chokepoint), because enrolling a passkey is granting a new key to the
+   * wallet and the person doing it has to prove they already hold one.
+   */
+  'passkey.enable': async (ctx, params) => {
+    const vault = await ctx.loadVault(params.password);
+    const prfOutput = fromBase64(params.prfOutput);
+    const vaultKey = generateVaultKey();
+    try {
+      if (prfOutput.length === 0) throw new AppError('PASSKEY_FAILED');
+      const plaintext = new TextEncoder().encode(JSON.stringify(vaultSchema.parse(vault)));
+      try {
+        const record: PasskeyRecord = {
+          v: 1,
+          credentialId: params.credentialId,
+          prfSalt: params.prfSalt,
+          vaultKeyUnderPasskey: await wrapVaultKeyWithPrf(
+            vaultKey,
+            prfOutput,
+            params.credentialId,
+            params.prfSalt,
+          ),
+          // The password wrapper is an ordinary keystore blob, which is what
+          // lets `persistVault` recover the vault key on a later mutation.
+          vaultKeyUnderPassword: await encryptKeystore(vaultKey, params.password),
+          vaultUnderVaultKey: await sealVault(plaintext, vaultKey),
+        };
+        await writePasskeyRecord(record);
+      } finally {
+        zeroize(plaintext);
+      }
+    } finally {
+      zeroize(vaultKey);
+      zeroize(prfOutput);
+    }
+    return {};
+  },
+
+  'passkey.disable': async () => {
+    await clearPasskeyRecord();
+    return {};
+  },
+
+  /**
+   * Unlock without the password.
+   *
+   * Note what is *not* here: `ctx.unlockGuard`. The throttle exists to make
+   * password guessing expensive, and there is nothing to guess in a 32-byte
+   * PRF output that an authenticator only produced after verifying the user.
+   * Counting failures here would let a stale record burn the attempts a user
+   * needs for the password path, which is the one that still works.
+   */
+  'passkey.unlock': async (ctx, params) => {
+    const record = await readPasskeyRecord();
+    if (record === null) throw new AppError('PASSKEY_NOT_ENROLLED');
+    const prfOutput = fromBase64(params.prfOutput);
+    let accounts: PublicAccount[] = [];
+    try {
+      const vaultKey = await unwrapVaultKeyWithPrf(
+        record.vaultKeyUnderPasskey,
+        prfOutput,
+        record.credentialId,
+        record.prfSalt,
+      );
+      try {
+        const plaintext = await openVault(record.vaultUnderVaultKey, vaultKey);
+        try {
+          const vault = vaultSchema.parse(JSON.parse(new TextDecoder().decode(plaintext)));
+          accounts = await unlockInto(ctx, vault);
+        } finally {
+          zeroize(plaintext);
+        }
+      } finally {
+        zeroize(vaultKey);
+      }
+    } catch (err) {
+      if (err instanceof PasskeyUnwrapError) throw new AppError('PASSKEY_FAILED');
+      throw err;
+    } finally {
+      zeroize(prfOutput);
+    }
+    return { accounts };
   },
 
   'settings.acknowledgeMainnet': async (ctx, params) => {
