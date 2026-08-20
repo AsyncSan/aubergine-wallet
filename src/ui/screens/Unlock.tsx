@@ -9,7 +9,7 @@
  * popup gains nothing (uiProgress rule: UI never gates security, and
  * security never trusts UI).
  */
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useT } from '../../i18n';
 import { api, rpcErrorI18nKey } from '../../messaging/client';
@@ -17,6 +17,7 @@ import { AppError, errorI18nKey } from '../../core/errors';
 import { clearUiProgress } from '../../state/ui-progress';
 import { Button, CountdownRing, Field, Notice, TextInput } from '../components/primitives';
 import { Prop3d } from '../components/props3d';
+import { PasskeyError, openInTab, passkeyNeedsTab, usePasskey } from '../passkey';
 
 export function Unlock(): ReactNode {
   const { t } = useT();
@@ -34,6 +35,46 @@ export function Unlock(): ReactNode {
   const [throttle, setThrottle] = useState<{ until: number; total: number } | null>(null);
   const [remaining, setRemaining] = useState(0);
   const passwordRef = useRef<HTMLInputElement | null>(null);
+  /** `null` until `passkey.status` has answered; the button never flickers in. */
+  const [passkey, setPasskey] = useState<{ credentialId: string; prfSalt: string } | null>(
+    null,
+  );
+  const [passkeyError, setPasskeyError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .passkeyStatus()
+      .then((status) => {
+        if (cancelled || !status.enrolled || !status.credentialId || !status.prfSalt) return;
+        setPasskey({ credentialId: status.credentialId, prfSalt: status.prfSalt });
+      })
+      .catch(() => {
+        /* no passkey offer; the password below is always the answer */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const unlockWithPasskey = useCallback(async (): Promise<void> => {
+    if (!passkey) return;
+    setBusy(true);
+    setPasskeyError(null);
+    try {
+      const prfOutput = await usePasskey(passkey.credentialId, passkey.prfSalt);
+      await api.passkeyUnlock(prfOutput);
+      await client.invalidateQueries();
+    } catch (err) {
+      setPasskeyError(
+        err instanceof PasskeyError
+          ? t(`passkey.error.${err.failure}`)
+          : t(rpcErrorI18nKey(err)),
+      );
+    } finally {
+      setBusy(false);
+    }
+  }, [client, passkey, t]);
 
   useEffect(() => {
     if (!throttle) return;
@@ -134,6 +175,36 @@ export function Unlock(): ReactNode {
       <Button type="submit" disabled={busy || throttled || password.length === 0}>
         {t('unlock.submit')}
       </Button>
+
+      {/*
+        The passkey offer sits *below* the password, not above it. It is the
+        convenient path, not the reliable one: an authenticator can be
+        unavailable, reset or left at home, and a wallet whose first offer is
+        the one that might not work teaches the wrong reflex. The password is
+        the way in; this is the shortcut.
+
+        The throttle disables it too. It guards the vault, not the password
+        field, and a lockout that a second button walks around is not a lockout.
+      */}
+      {passkey ? (
+        <>
+          <Button
+            type="button"
+            tone="secondary"
+            disabled={busy || throttled}
+            onClick={() => {
+              if (passkeyNeedsTab()) {
+                void openInTab();
+                return;
+              }
+              void unlockWithPasskey();
+            }}
+          >
+            {t('passkey.unlockAction')}
+          </Button>
+          {passkeyError ? <Notice tone="warn">{passkeyError}</Notice> : null}
+        </>
+      ) : null}
 
       <div className="mt-auto flex flex-col gap-2 pb-2">
         <button

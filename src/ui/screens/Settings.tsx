@@ -33,6 +33,7 @@ import {
 import { useUiStore } from '../../state/store';
 import { useMarkUiProgress } from '../../state/ui-progress';
 import { dropOrigins, ensureOrigins } from '../permissions';
+import { PasskeySection } from '../components/PasskeySection';
 import {
   Button,
   Card,
@@ -413,6 +414,13 @@ export function Settings({
           ))}
         </Select>
       </Field>
+
+      {/*
+        Passkey unlock sits directly under the auto-lock setting: both answer
+        the same question ("how often do I type my password, and what happens
+        when I do not"), and the shortcut belongs next to the thing it shortens.
+      */}
+      <PasskeySection />
 
       {/* ---- network (§4, v1.2: available in both modes, gated for Mainnet) ---- */}
       <Field label={t('settings.network')}>

@@ -193,6 +193,13 @@ export const api = {
   revealRecoveryPhrase: (password: string) =>
     rpc('wallet.revealRecoveryPhrase', { password }),
   reset: () => rpc('wallet.reset', { confirm: true }),
+  /* Passkey unlock. The WebAuthn half lives in `src/ui/passkey.ts`; these are
+     only the four calls that touch stored material. */
+  passkeyStatus: () => rpc('passkey.status', {}),
+  passkeyPrepare: () => rpc('passkey.prepare', {}),
+  passkeyEnable: (params: RpcParamsInput<'passkey.enable'>) => rpc('passkey.enable', params),
+  passkeyDisable: () => rpc('passkey.disable', {}),
+  passkeyUnlock: (prfOutput: string) => rpc('passkey.unlock', { prfOutput }),
   accounts: () => rpc('account.list', {}),
   addAccount: (label: string, password: string) =>
     rpc('account.add', { label, password }),

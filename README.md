@@ -254,6 +254,17 @@ AES-256-GCM. Unlocking is throttled after four failed attempts, growing
 exponentially to a 30 minute ceiling, and the counter survives a browser
 restart.
 
+The password that protects the vault is gated on strength, not only on length.
+An 8-character floor alone does not survive an offline grind of a stolen
+keystore blob: Argon2id at these parameters buys roughly 15-20 bits, and the
+password has to carry the rest. The create and import flows therefore require a
+minimum score from the entropy estimator in `core/password-strength.ts` (no
+zxcvbn, so no 400 kB of dictionaries in a wallet bundle). The rule is enforced
+in the background's request schema, not only by the disabled Continue button,
+because a rule that lives in a `disabled` attribute is a suggestion. Verifying
+an *existing* password is deliberately exempt, so nobody whose password predates
+the floor is locked out of their own wallet.
+
 The lockout deadline is a wall-clock instant, and the system clock belongs to
 whoever is at the machine, so the throttle does not simply believe it. Winding
 the clock backwards is detected and costs the full delay again from the new
