@@ -160,6 +160,113 @@ export function TxConfirm({
         <p className="text-[11px] leading-relaxed text-muted">{t('confirm.feeMaxHint')}</p>
       </section>
 
+      {/*
+        The decoded contract call. Shown in *both* modes, unlike the reserve
+        breakdown and the XDR below: a beginner who reaches this screen at all
+        (the wallet's own swap flow, or developer mode) is being asked to
+        approve a contract call, and hiding what it calls would leave exactly
+        the audience least able to reconstruct it with the least information.
+      */}
+      {description.invocations.map((invocation) => (
+        <section key={invocation.opIndex} className="flex flex-col gap-1.5">
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-muted">
+            {t('confirm.contractCall')}
+          </h2>
+          <Card className="flex flex-col gap-1 text-xs">
+            {/*
+              Not run through `shorten()`. That helper cuts to 6+6 characters,
+              which is fine for the sender row (the user already knows their own
+              account) and wrong here: the contract id is the one value a user
+              checks character by character against the address a dApp
+              published, and 6+6 is inside reach of a vanity-key generator.
+              Full value, wrapped.
+            */}
+            {invocation.call && invocation.call.contractId !== '' ? (
+              <Row label={t('confirm.contract')} value={invocation.call.contractId} mono />
+            ) : null}
+            {invocation.call && invocation.call.functionName !== '' ? (
+              <Row label={t('confirm.function')} value={invocation.call.functionName} mono />
+            ) : null}
+            {invocation.executableKey ? (
+              <Row label={t('confirm.executable')} value={t(invocation.executableKey)} />
+            ) : null}
+            {invocation.wasmHash ? (
+              <Row label={t('confirm.wasmHash')} value={invocation.wasmHash} mono />
+            ) : null}
+            {invocation.wasmByteLength !== null ? (
+              <Row
+                label={t('confirm.wasmSize')}
+                value={`${invocation.wasmByteLength} B`}
+              />
+            ) : null}
+
+            {invocation.call ? (
+              <div className="flex flex-col gap-1 pt-1">
+                <span className="text-muted">{t('confirm.arguments')}</span>
+                {invocation.call.args.length === 0 ? (
+                  <span className="text-text">{t('confirm.noArguments')}</span>
+                ) : (
+                  <ol className="flex list-decimal flex-col gap-0.5 pl-4">
+                    {invocation.call.args.map((arg, i) => (
+                      <li key={i} className="break-all text-text">
+                        <span className="text-muted">{t(arg.typeKey)}: </span>
+                        <span className="font-mono">{arg.value}</span>
+                        {arg.truncated ? (
+                          <span className="text-muted"> ({t('confirm.argTruncated')})</span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ol>
+                )}
+                {invocation.call.argsOmitted > 0 ? (
+                  <span className="text-muted">
+                    {t('confirm.argsOmitted', { count: invocation.call.argsOmitted })}
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
+
+            {invocation.auth.length > 0 ? (
+              <div className="flex flex-col gap-1 pt-2">
+                <span className="text-muted">{t('confirm.authTitle')}</span>
+                {invocation.auth.map((entry, i) => (
+                  <div key={i} className="flex flex-col gap-0.5">
+                    <span className="text-muted">
+                      {entry.credential === 'address' && entry.address !== ''
+                        ? t('confirm.authAddress', { address: entry.address })
+                        : t('confirm.authSourceAccount')}
+                    </span>
+                    <ul className="flex flex-col gap-0.5">
+                      {entry.invocations.map((node, j) => (
+                        <li
+                          key={j}
+                          className="break-all font-mono text-text"
+                          /* Indentation carries the tree depth; the list is
+                             breadth-first, so a sibling never disappears
+                             behind another branch's sub-tree. */
+                          style={{ paddingLeft: `${node.depth * 10}px` }}
+                        >
+                          {node.contractId === '' ? '—' : node.contractId}
+                          {node.functionName === '' ? '' : ` · ${node.functionName}`}
+                        </li>
+                      ))}
+                    </ul>
+                    {entry.nodesOmitted > 0 ? (
+                      <span className="text-muted">
+                        {t('confirm.authNodesOmitted', { count: entry.nodesOmitted })}
+                      </span>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </Card>
+          <p className="text-[11px] leading-relaxed text-muted">
+            {t('confirm.contractCallHint')}
+          </p>
+        </section>
+      ))}
+
       {/* §4: numeric reserve breakdown is a developer-mode surface. */}
       {isDeveloper && snapshot ? (
         <section className="flex flex-col gap-1.5">

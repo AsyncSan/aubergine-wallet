@@ -570,7 +570,11 @@ describe('describeTransaction: required warnings (§5)', () => {
     });
     const d = describeTransaction(build([op]), baseCtx);
     expect(codes(d.warnings)).toContain('SOROBAN_INVOCATION');
-    expect(d.effects[0]?.message.key).toBe('tx.op.invokeHostFunction');
+    // The line names the call now; the generic "(call a function)" wording was
+    // identical for every contract call ever built.
+    expect(d.effects[0]?.message.key).toBe('tx.op.invokeContract');
+    expect(d.effects[0]?.message.params?.fn).toBe('hello');
+    expect(d.invocations[0]?.call?.contractId).toBe(contractId);
   });
 });
 
