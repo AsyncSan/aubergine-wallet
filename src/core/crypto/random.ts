@@ -49,3 +49,24 @@ export function shuffled<T>(items: readonly T[]): T[] {
   }
   return out;
 }
+
+/**
+ * A string of `length` characters drawn uniformly from `alphabet`.
+ *
+ * Same reasoning as {@link randomInt}: the one caller is the *file name* of a
+ * downloaded recovery-phrase backup, which is not a secret and would survive a
+ * weak generator without anyone noticing. It goes through the CSPRNG anyway
+ * because the alternative is a `Math.random()` in a wallet that somebody has to
+ * defend in a review.
+ */
+export function randomString(length: number, alphabet: string): string {
+  if (!Number.isInteger(length) || length <= 0) {
+    throw new RangeError(`length must be a positive integer: ${length}`);
+  }
+  if (alphabet.length < 2) {
+    throw new RangeError('alphabet needs at least two characters');
+  }
+  let out = '';
+  for (let i = 0; i < length; i += 1) out += alphabet[randomInt(alphabet.length)];
+  return out;
+}

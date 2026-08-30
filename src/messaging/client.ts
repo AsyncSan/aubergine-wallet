@@ -192,6 +192,8 @@ export const api = {
     }),
   revealRecoveryPhrase: (password: string) =>
     rpc('wallet.revealRecoveryPhrase', { password }),
+  revealSecretKey: (password: string, accountIndex: number) =>
+    rpc('wallet.revealSecretKey', { password, accountIndex }),
   reset: () => rpc('wallet.reset', { confirm: true }),
   /* Passkey unlock. The WebAuthn half lives in `src/ui/passkey.ts`; these are
      only the four calls that touch stored material. */
@@ -237,6 +239,18 @@ export const api = {
   getSettings: () => rpc('settings.get', {}),
   setSettings: (patch: RpcParamsInput<'settings.set'>['patch']) =>
     rpc('settings.set', { patch }),
+  /* Hardware accounts. The device itself is only reachable from a window
+     context (`src/core/ledger/webhid.ts`); these are the four calls that
+     touch the vault or authorise a signature, and they all stay in the
+     background where every other guard lives. */
+  ledgerAddAccount: (params: RpcParamsInput<'ledger.addAccount'>) =>
+    rpc('ledger.addAccount', params),
+  ledgerBeginSign: (xdr: string, accountIndex?: number) =>
+    rpc('ledger.beginSign', accountIndex === undefined ? { xdr } : { xdr, accountIndex }),
+  ledgerSignRequest: (requestId: string) => rpc('ledger.signRequest', { requestId }),
+  ledgerCompleteSign: (requestId: string, signature: string) =>
+    rpc('ledger.completeSign', { requestId, signature }),
+  ledgerCancelSign: (requestId: string) => rpc('ledger.cancelSign', { requestId }),
   pendingPrompt: () => rpc('dapp.pendingPrompt', {}),
   resolvePrompt: (requestId: string, approved: boolean) =>
     rpc('dapp.resolvePrompt', { requestId, approved }),

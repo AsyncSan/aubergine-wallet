@@ -13,7 +13,7 @@ export default defineConfig({
     name: 'Aubergine',
     description: '__MSG_extDescription__',
     default_locale: 'en',
-    version: '1.0.0',
+    version: '1.2.0',
     /**
      * Chrome refuses to install the package on anything older, instead of
      * installing it and breaking at runtime. 110 is not a guess: the Vite

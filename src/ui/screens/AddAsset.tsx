@@ -13,6 +13,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { StrKey } from '@stellar/stellar-sdk';
 import { useT } from '../../i18n';
 import { api, formatRpcError, isRpcTimeout } from '../../messaging/client';
+import { signsOnDevice, startLedgerSigning } from '../ledger-window';
 import { effectiveNetworkId, type Settings } from '../../core/settings';
 import type { RpcResult } from '../../messaging/protocol';
 import { curatedAssetsFor } from '../../core/stellar/networks';
@@ -46,6 +47,7 @@ export function AddAsset({
 }): ReactNode {
   const { t } = useT();
   const index = accounts.selectedIndex;
+  const account = accounts.accounts.find((a) => a.index === index);
   const balances = useBalances(index, true);
   const invalidate = useInvalidateAccountData();
   const forgetPending = useInvalidatePendingSubmission();
@@ -56,6 +58,8 @@ export function AddAsset({
   const curatedAssets = curatedAssetsFor(effectiveNetworkId(settings));
 
   const [stage, setStage] = useState<Stage>('form');
+  /** Set once the Ledger window has taken over; this screen is done. */
+  const [ledgerHandoff, setLedgerHandoff] = useState(false);
   const [assetCode, setAssetCode] = useState('');
   const [issuer, setIssuer] = useState('');
   const [limit, setLimit] = useState('');
@@ -122,6 +126,12 @@ export function AddAsset({
     setBusy(true);
     setError(null);
     try {
+      // Same handover as in `Send`: the device is not reachable from a popup.
+      if (signsOnDevice(account)) {
+        await startLedgerSigning(xdr, index);
+        setLedgerHandoff(true);
+        return;
+      }
       const signed = await api.signTx(xdr);
       const result = await api.submitTx(signed.signedXdr);
       if (result.outcome === 'unknown') {
@@ -205,13 +215,16 @@ export function AddAsset({
       <div className="flex h-full flex-col">
         <ScreenHeader title={t('confirm.title')} onBack={() => setStage('form')} />
         {error ? <Notice tone="danger">{error}</Notice> : null}
+        {/* Same handover notice as in `Send`. */}
+        {ledgerHandoff ? <Notice tone="info">{t('ledger.send.opening')}</Notice> : null}
         <TxConfirm
           description={description.data}
           mode={settings.mode}
           snapshot={balances.data}
-          busy={busy}
+          busy={busy || ledgerHandoff}
           onConfirm={() => void confirmAndSubmit()}
           onReject={() => setStage('form')}
+          {...(signsOnDevice(account) ? { confirmLabel: t('ledger.send.route') } : {})}
         />
       </div>
     );

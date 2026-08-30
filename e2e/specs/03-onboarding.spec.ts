@@ -5,6 +5,7 @@
  * The address is checked with `StrKey` in the *test* process, so the checksum
  * verdict does not come from the same code that produced it.
  */
+import { readFileSync } from 'node:fs';
 import { StrKey } from '@stellar/stellar-sdk';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { expect, readStorage, rpc, screenshot, test } from '../support/extension';
@@ -44,6 +45,43 @@ test('create a wallet: phrase, verification, unlocked Home with a valid address'
   const words = (await items.allInnerTexts()).map((t) => t.trim().replace(/^\d+\s*/u, ''));
   for (const word of words) expect(wordlist).toContain(word);
   await screenshot(popup, '03-onboarding-phrase');
+
+  // The optional file backup. Two clicks by design: the first only opens the
+  // warning, the second writes the file — and the file has to actually arrive,
+  // which is the part no unit test can prove (blob URL + `<a download>` under
+  // the popup's `default-src 'self'` CSP).
+  await popup.getByRole('button', { name: 'Stattdessen als Datei speichern' }).click();
+  await expect(popup.getByText(/Eine Datei ist bequem/u)).toBeVisible();
+
+  // The name is announced *before* the download, so it survives a browser that
+  // closes the popup the moment a file starts saving.
+  const announced = (await popup.getByText(/Die Datei wird/u).innerText())
+    .match(/[0-9bcdfghjkmnpqrstvwxz]{16}\.txt/u)?.[0];
+  expect(announced, 'the warning does not name the file').toBeTruthy();
+  await screenshot(popup, '03b-onboarding-phrase-file');
+
+  const [download] = await Promise.all([
+    popup.waitForEvent('download', { timeout: 15_000 }),
+    popup.getByRole('button', { name: 'Risiko verstanden, herunterladen' }).click(),
+  ]);
+
+  // What was promised is what gets saved, and the file carries the phrase and
+  // its warnings.
+  const suggested = download.suggestedFilename();
+  expect(suggested).toBe(announced);
+  const contents = readFileSync(await download.path(), 'utf8');
+  for (const word of words) expect(contents).toContain(word);
+  expect(contents).toContain(words.join(' '));
+  expect(contents).toContain('Wiederherstellungssatz');
+  expect(contents.replace(/\s+/gu, ' ')).toContain(
+    'Wer diese Wörter liest, kann über das gesamte Guthaben verfügen.',
+  );
+  // The screen names the file again afterwards, because a random name is
+  // otherwise unfindable.
+  const saved = popup.getByText(suggested, { exact: false });
+  await expect(saved).toBeVisible();
+  await saved.scrollIntoViewIfNeeded();
+  await screenshot(popup, '03c-onboarding-phrase-saved');
 
   await popup.getByRole('button', { name: 'Ich habe die Wörter aufgeschrieben' }).click();
 

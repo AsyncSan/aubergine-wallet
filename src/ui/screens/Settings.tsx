@@ -6,6 +6,8 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { useT } from '../../i18n';
 import { api } from '../../messaging/client';
+import type { RpcResult } from '../../messaging/protocol';
+import { ledgerSupported, openLedgerAccountWindow } from '../ledger-window';
 import { AppError, errorI18nKey } from '../../core/errors';
 import {
   AUTO_LOCK_OPTIONS_MINUTES,
@@ -37,6 +39,7 @@ import { PasskeySection } from '../components/PasskeySection';
 import {
   Button,
   Card,
+  CopyableAddress,
   Field,
   Notice,
   ScreenHeader,
@@ -130,6 +133,17 @@ export function Settings({
   const [phraseError, setPhraseError] = useState<string | null>(null);
   const [showPhraseForm, setShowPhraseForm] = useState(false);
   const [phraseSecondsLeft, setPhraseSecondsLeft] = useState(PHRASE_AUTO_HIDE_SECONDS);
+  /**
+   * The per-account secret-key export. Its own password field rather than the
+   * phrase one above: the two forms can be open at the same time, and sharing
+   * a string would mean typing into one and revealing from the other.
+   */
+  const [showSecretForm, setShowSecretForm] = useState(false);
+  const [secretPassword, setSecretPassword] = useState('');
+  const [secretIndex, setSecretIndex] = useState<number | null>(null);
+  const [secret, setSecret] = useState<RpcResult<'wallet.revealSecretKey'> | null>(null);
+  const [secretError, setSecretError] = useState<string | null>(null);
+  const [secretSecondsLeft, setSecretSecondsLeft] = useState(PHRASE_AUTO_HIDE_SECONDS);
   const [permissionNotice, setPermissionNotice] = useState<string | null>(null);
   const [showAddAccount, setShowAddAccount] = useState(false);
   const [accountPassword, setAccountPassword] = useState('');
@@ -140,6 +154,17 @@ export function Settings({
   const [rpcDraft, setRpcDraft] = useState(settings.sorobanRpcOverride ?? '');
   const [rpcError, setRpcError] = useState<string | null>(null);
   const [rpcSaved, setRpcSaved] = useState(false);
+
+  /**
+   * Which account the secret-key form is pointed at. Defaults to the one in
+   * use, so the common case needs no thought; `secretIndex` only holds a
+   * *deliberate* choice, which is why it starts as null instead of copying the
+   * selection (a copy would go stale the moment the user switches accounts).
+   */
+  const secretAccounts = accountsQuery.data?.accounts ?? [];
+  const chosenSecretIndex =
+    secretIndex ?? accountsQuery.data?.selectedIndex ?? secretAccounts[0]?.index ?? 0;
+  const chosenSecretAccount = secretAccounts.find((a) => a.index === chosenSecretIndex);
 
   const isDeveloper = settings.mode === 'developer';
   const onMainnet = isMainnetActive(settings);
@@ -160,6 +185,8 @@ export function Settings({
       setPhrasePassphrase(null);
       setPassword('');
       setAccountPassword('');
+      setSecret(null);
+      setSecretPassword('');
     };
   }, []);
 
@@ -198,6 +225,41 @@ export function Settings({
       await markProgress({ backupConfirmed: true });
     } catch (err) {
       setPhraseError(
+        err instanceof AppError
+          ? t(errorI18nKey(err.code), { seconds: err.detail ?? '?' })
+          : t('error.INTERNAL_ERROR'),
+      );
+    }
+  }
+
+  /**
+   * Same auto-hide as the phrase above, same reasoning, and the same 60
+   * seconds: a secret key on display is a secret key anyone walking past can
+   * photograph, and this one fits in a single camera frame.
+   */
+  useEffect(() => {
+    if (secret === null) return;
+    setSecretSecondsLeft(PHRASE_AUTO_HIDE_SECONDS);
+    const interval = setInterval(
+      () => setSecretSecondsLeft((s) => Math.max(0, s - 1)),
+      1000,
+    );
+    return () => clearInterval(interval);
+  }, [secret]);
+
+  useEffect(() => {
+    if (secret === null || secretSecondsLeft > 0) return;
+    setSecret(null);
+    setShowSecretForm(false);
+  }, [secret, secretSecondsLeft]);
+
+  async function revealSecretKey(index: number): Promise<void> {
+    setSecretError(null);
+    try {
+      setSecret(await api.revealSecretKey(secretPassword, index));
+      setSecretPassword('');
+    } catch (err) {
+      setSecretError(
         err instanceof AppError
           ? t(errorI18nKey(err.code), { seconds: err.detail ?? '?' })
           : t('error.INTERNAL_ERROR'),
@@ -632,8 +694,15 @@ export function Settings({
         {(accountsQuery.data?.accounts ?? []).map((account) => (
           <Card key={account.index} className="flex items-center justify-between gap-2">
             <div className="min-w-0">
-              <p className="text-sm text-text">
+              <p className="flex items-center gap-1.5 text-sm text-text">
                 {account.label || t('home.accountLabel', { index: account.index + 1 })}
+                {/* Where the key lives is not cosmetic: it decides whether
+                    signing happens here or on a device the user has to hold. */}
+                {account.source === 'ledger' ? (
+                  <span className="shrink-0 rounded-token-sm border border-border px-1.5 py-0.5 text-[10px] text-muted">
+                    {t('ledger.account.badge')}
+                  </span>
+                ) : null}
               </p>
               <p className="truncate font-mono text-[10px] text-muted">{account.publicKey}</p>
             </div>
@@ -654,6 +723,21 @@ export function Settings({
             )}
           </Card>
         ))}
+        {/* ---- hardware wallet ---- */}
+        <Card className="flex flex-col gap-2">
+          <p className="text-sm text-text">{t('ledger.settings.title')}</p>
+          <p className="text-xs text-muted">{t('ledger.settings.body')}</p>
+          {ledgerSupported() ? (
+            <Button tone="secondary" onClick={() => void openLedgerAccountWindow()}>
+              {t('ledger.settings.manage')}
+            </Button>
+          ) : (
+            /* Firefox has no WebHID and has declined to implement it. A
+               disabled button with no explanation would read as a bug. */
+            <Notice tone="info">{t('ledger.unsupportedBrowser')}</Notice>
+          )}
+        </Card>
+
         {showAddAccount ? (
           <Card className="flex flex-col gap-2">
             <p className="text-xs text-muted">{t('settings.accountAddBody')}</p>
@@ -758,6 +842,102 @@ export function Settings({
         ) : (
           <Button tone="secondary" onClick={() => setShowPhraseForm(true)}>
             {t('settings.recovery')}
+          </Button>
+        )}
+      </section>
+
+      {/* ---- secret key, per account ---- */}
+      <section className="flex flex-col gap-2">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-muted">
+          {t('settings.secretKey')}
+        </h2>
+        {secret ? (
+          <Card className="flex flex-col gap-2">
+            <div>
+              <p className="text-xs text-muted">{t('settings.secretKeyBelongsTo')}</p>
+              {/* Public key and path first, and above the secret: this is the
+                  user's own check that the key they are about to copy belongs
+                  to the account they meant. */}
+              <p className="break-all font-mono text-[10px] text-muted">{secret.publicKey}</p>
+              <p className="font-mono text-[10px] text-muted">{secret.path}</p>
+            </div>
+            <CopyableAddress value={secret.secretKey} />
+            <p className="text-xs text-muted">{t('settings.secretKeyClipboard')}</p>
+            <p className="text-xs text-muted">
+              {t('settings.recoveryAutoHide', { seconds: secretSecondsLeft })}
+            </p>
+            <button
+              type="button"
+              className="self-start text-xs text-accent-fg"
+              onClick={() => {
+                setSecret(null);
+                setShowSecretForm(false);
+              }}
+            >
+              {t('app.close')}
+            </button>
+          </Card>
+        ) : showSecretForm ? (
+          <Card className="flex flex-col gap-2">
+            <Notice tone="danger">{t('settings.secretKeyWarning')}</Notice>
+            <p className="text-xs text-muted">{t('settings.secretKeyBody')}</p>
+            {/* One key per account, so which account has to be a choice — and
+                a visible one even when there is only one, so nobody assumes
+                this is the whole wallet. */}
+            <Field label={t('settings.secretKeyAccount')}>
+              <Select
+                value={String(chosenSecretIndex)}
+                onChange={(e) => {
+                  setSecretIndex(Number(e.target.value));
+                  setSecretError(null);
+                }}
+              >
+                {secretAccounts.map((account) => (
+                  <option key={account.index} value={account.index}>
+                    {`${account.label || t('home.accountLabel', { index: account.index + 1 })} · ${account.publicKey.slice(0, 6)}…${account.publicKey.slice(-4)}`}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            {chosenSecretAccount?.source === 'ledger' ? (
+              <Notice tone="info">{t('error.NO_SECRET_KEY')}</Notice>
+            ) : (
+              <Field label={t('onboarding.password.label')}>
+                <TextInput
+                  type="password"
+                  autoComplete="current-password"
+                  value={secretPassword}
+                  onChange={(e) => setSecretPassword(e.target.value)}
+                />
+              </Field>
+            )}
+            {secretError ? <Notice tone="danger">{secretError}</Notice> : null}
+            <div className="flex gap-2">
+              <Button
+                tone="secondary"
+                className="flex-1"
+                onClick={() => {
+                  setShowSecretForm(false);
+                  setSecretPassword('');
+                  setSecretError(null);
+                }}
+              >
+                {t('app.cancel')}
+              </Button>
+              <Button
+                className="flex-1"
+                disabled={
+                  secretPassword.length === 0 || chosenSecretAccount?.source === 'ledger'
+                }
+                onClick={() => void revealSecretKey(chosenSecretIndex)}
+              >
+                {t('app.confirm')}
+              </Button>
+            </div>
+          </Card>
+        ) : (
+          <Button tone="secondary" onClick={() => setShowSecretForm(true)}>
+            {t('settings.secretKeyShow')}
           </Button>
         )}
       </section>

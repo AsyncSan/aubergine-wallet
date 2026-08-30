@@ -4,10 +4,10 @@
  * material; then read the entire `chrome.storage` in the unlocked state and
  * check the same there.
  *
- * The single permitted exception is `wallet.revealRecoveryPhrase`, and the test
- * asserts that it is the *only* one; a new leaking method would fail here even
- * if nobody remembered to update this file, because the method list is taken
- * from the protocol itself.
+ * The permitted exceptions are `wallet.revealRecoveryPhrase` and
+ * `wallet.revealSecretKey`, and the test asserts that they are the *only* two;
+ * a new leaking method would fail here even if nobody remembered to update this
+ * file, because the method list is taken from the protocol itself.
  */
 import { Account, Keypair, Networks, Operation, TransactionBuilder } from '@stellar/stellar-sdk';
 import { RPC_METHODS } from '../../src/messaging/protocol';
@@ -32,7 +32,7 @@ function leaksIn(text: string, mnemonic: string, password: string): string[] {
   return problems;
 }
 
-test('no protocol method except revealRecoveryPhrase returns key material', async ({
+test('no protocol method outside the two audited exceptions returns key material', async ({
   popup,
   horizon,
   errors,
@@ -114,16 +114,65 @@ test('no protocol method except revealRecoveryPhrase returns key material', asyn
   await record('wallet.lock', {});
   await record('wallet.unlock', { password: TEST_PASSWORD });
 
-  // The declared exception, and the reset/import pair afterwards.
+  // Passkey unlock. Headless Chromium has no authenticator, so the ceremony is
+  // replaced by a fixed 32-byte PRF output; everything the background does with
+  // it (wrap the vault key, store it, unwrap it again) is the real code path,
+  // and that is what has to be checked for leaks. The enrolment is removed
+  // again at the end so the rest of the spec sees the state it expects.
+  const PRF_OUTPUT = Buffer.from(new Uint8Array(32).fill(7)).toString('base64');
+  const prepared = await record('passkey.prepare', {});
+  const prfSalt = (prepared.result as { prfSalt: string }).prfSalt;
+  await record('passkey.enable', {
+    password: TEST_PASSWORD,
+    credentialId: Buffer.from(new Uint8Array(16).fill(3)).toString('base64'),
+    prfSalt,
+    prfOutput: PRF_OUTPUT,
+  });
+  const status = await record('passkey.status', {});
+  expect((status.result as { enrolled: boolean }).enrolled, 'passkey enrolment failed').toBe(true);
+  await rpc(popup, 'wallet.lock', {});
+  const passkeyUnlock = await record('passkey.unlock', { prfOutput: PRF_OUTPUT });
+  expect(
+    (passkeyUnlock.result as { accounts: unknown[] } | undefined)?.accounts?.length ?? 0,
+    'passkey.unlock did not open the wallet, so the leak check below proves nothing',
+  ).toBeGreaterThan(0);
+  await record('passkey.disable', {});
+
+  /**
+   * Hardware accounts. Enrolled this late on purpose: the account is added to
+   * the vault, and everything above expects a wallet of seed accounts only.
+   * None of these five methods can leak a key, because the wallet never has
+   * one for a device account — which is the claim, so it gets checked.
+   */
+  const DEVICE_KEY = Keypair.random().publicKey();
+  await record('ledger.addAccount', {
+    password: TEST_PASSWORD,
+    derivationIndex: 0,
+    publicKey: DEVICE_KEY,
+    label: 'Ledger',
+  });
+  // Refused: the selected account signs here, not on a device. The refusal is
+  // what gets checked for leaks, same as any answer.
+  await record('ledger.beginSign', { xdr });
+  await record('ledger.signRequest', { requestId: 'does-not-exist' });
+  await record('ledger.completeSign', {
+    requestId: 'does-not-exist',
+    signature: Buffer.from(new Uint8Array(64).fill(9)).toString('base64'),
+  });
+  await record('ledger.cancelSign', { requestId: 'does-not-exist' });
+
+  // The declared exceptions, and the reset/import pair afterwards.
   const revealed = await record('wallet.revealRecoveryPhrase', { password: TEST_PASSWORD });
+  const revealedKey = await record('wallet.revealSecretKey', {
+    password: TEST_PASSWORD,
+    accountIndex: 0,
+  });
   await record('wallet.reset', { confirm: true });
   await record('wallet.importMnemonic', { password: TEST_PASSWORD, mnemonic });
 
-  // Every method in the protocol must have been exercised: a new one added to
-  // §6 without a leak check here fails this assertion.
-  expect([...answers.keys()].sort()).toEqual([...RPC_METHODS].sort());
-
-  // …and only the declared exception may carry recovery material.
+  // Only the declared exceptions may carry key material. Asserted *before* the
+  // coverage check below: this is the verdict the file exists for, and a
+  // newly added, still-unexercised method must not hide it.
   const leaking: string[] = [];
   const details: string[] = [];
   for (const [method, response] of answers) {
@@ -133,8 +182,19 @@ test('no protocol method except revealRecoveryPhrase returns key material', asyn
       details.push(`${method}: ${problems.join(', ')}`);
     }
   }
-  expect(leaking, details.join('\n')).toEqual(['wallet.revealRecoveryPhrase']);
+  expect(leaking.sort(), details.join('\n')).toEqual([
+    'wallet.revealRecoveryPhrase',
+    'wallet.revealSecretKey',
+  ]);
   expect((revealed.result as { mnemonic: string }).mnemonic).toBe(mnemonic);
+  // The secret really is this account's, checked with the SDK in the test
+  // process rather than against the value the wallet just produced.
+  const secretKey = (revealedKey.result as { secretKey: string }).secretKey;
+  expect(Keypair.fromSecret(secretKey).publicKey()).toBe(address);
+
+  // Every method in the protocol must have been exercised: a new one added to
+  // §6 without a leak check here fails this assertion.
+  expect([...answers.keys()].sort()).toEqual([...RPC_METHODS].sort());
   expect(errors.problems, errors.format()).toHaveLength(0);
 });
 

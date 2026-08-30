@@ -20,8 +20,14 @@ const PASSPHRASE = 'p4ssphr4se';
 const PASSPHRASE_ACCOUNT_0 = 'GDAHPZ2NSYIIHZXM56Y36SBVTV5QKFIZGYMMBHOU53ETUSWTP62B63EQ';
 
 
+/**
+ * Built through `vaultSchema.parse` rather than as a literal, so the whole
+ * suite below runs against a vault that came through the v1 -> v2 migration.
+ * If the migration ever moved an account to a different derivation index, the
+ * hardcoded SEP-0005 keys in this file would stop matching.
+ */
 function vault(accounts = [{ index: 0, label: '' }]): Vault {
-  return { version: 1, mnemonic: MNEMONIC, accounts };
+  return vaultSchema.parse({ version: 1, mnemonic: MNEMONIC, accounts });
 }
 
 function paymentTx(source: string): ReturnType<TransactionBuilder['build']> {
@@ -70,7 +76,17 @@ describe('Keyring', () => {
     expect(serialized).not.toContain(SECRET_0);
     expect(serialized).not.toContain(MNEMONIC);
     for (const account of keyring.listAccounts()) {
-      expect(Object.keys(account).sort()).toEqual(['index', 'label', 'path', 'publicKey']);
+      // An exact list, not a subset check: the point of this assertion is that
+      // a field added to the account shape has to be looked at once by a human
+      // before it starts travelling to the popup.
+      expect(Object.keys(account).sort()).toEqual([
+        'derivationIndex',
+        'index',
+        'label',
+        'path',
+        'publicKey',
+        'source',
+      ]);
     }
   });
 
@@ -142,7 +158,13 @@ describe('Keyring', () => {
   it('rejects a vault whose recovery phrase is invalid', async () => {
     const keyring = new Keyring();
     await expect(
-      keyring.unlock({ version: 1, mnemonic: 'not a real phrase', accounts: [{ index: 0, label: '' }] }),
+      keyring.unlock(
+        vaultSchema.parse({
+          version: 1,
+          mnemonic: 'not a real phrase',
+          accounts: [{ index: 0, label: '' }],
+        }),
+      ),
     ).rejects.toBeInstanceOf(AppError);
     expect(keyring.isUnlocked).toBe(false);
   });
@@ -185,22 +207,26 @@ describe('Keyring', () => {
   describe('BIP-39 passphrase (finding 7)', () => {
     it('derives the SEP-0005 test-4 account when the vault carries a passphrase', async () => {
       const keyring = new Keyring();
-      await keyring.unlock({
-        version: 1,
-        mnemonic: PASSPHRASE_MNEMONIC,
-        bip39Passphrase: PASSPHRASE,
-        accounts: [{ index: 0, label: '' }],
-      });
+      await keyring.unlock(
+        vaultSchema.parse({
+          version: 1,
+          mnemonic: PASSPHRASE_MNEMONIC,
+          bip39Passphrase: PASSPHRASE,
+          accounts: [{ index: 0, label: '' }],
+        }),
+      );
       expect(keyring.publicKeyOf(0)).toBe(PASSPHRASE_ACCOUNT_0);
     });
 
     it('derives a different wallet without the passphrase', async () => {
       const keyring = new Keyring();
-      await keyring.unlock({
-        version: 1,
-        mnemonic: PASSPHRASE_MNEMONIC,
-        accounts: [{ index: 0, label: '' }],
-      });
+      await keyring.unlock(
+        vaultSchema.parse({
+          version: 1,
+          mnemonic: PASSPHRASE_MNEMONIC,
+          accounts: [{ index: 0, label: '' }],
+        }),
+      );
       // This is the trap finding 7 describes: same words, silently different,
       // empty wallet. The expected key is derived here rather than hardcoded.
       const { deriveStellarPublicKey, mnemonicToSeed } = await import(

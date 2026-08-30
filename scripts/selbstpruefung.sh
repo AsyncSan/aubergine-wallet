@@ -43,8 +43,8 @@ if ! npm run build:firefox >/dev/null 2>&1; then
   bad "build:firefox schlägt fehl"
 else
   npx --yes addons-linter .output/firefox-mv3 --output json > "$OUT/addons-linter.json" 2>/dev/null
-  ERRORS=$(node -p "JSON.parse(require('fs').readFileSync('$OUT/addons-linter.json','utf8')).summary.errors" 2>/dev/null || echo "?")
-  WARNINGS=$(node -p "JSON.parse(require('fs').readFileSync('$OUT/addons-linter.json','utf8')).summary.warnings" 2>/dev/null || echo "?")
+  ERRORS=$(node -e "process.stdout.write(String(JSON.parse(require('fs').readFileSync('$OUT/addons-linter.json','utf8')).summary.errors))" 2>/dev/null || echo "?")
+  WARNINGS=$(node -e "process.stdout.write(String(JSON.parse(require('fs').readFileSync('$OUT/addons-linter.json','utf8')).summary.warnings))" 2>/dev/null || echo "?")
   if [ "$ERRORS" = "0" ]; then ok "0 Fehler, $WARNINGS Warnungen"
   else bad "$ERRORS Fehler (siehe $OUT/addons-linter.json)"; fi
 fi
@@ -52,8 +52,8 @@ fi
 # ------------------------------------------------------------------- 2 audit
 step "2/4  npm audit"
 npm audit --json > "$OUT/npm-audit.json" 2>/dev/null
-TOTAL=$(node -p "Object.keys(JSON.parse(require('fs').readFileSync('$OUT/npm-audit.json','utf8')).vulnerabilities||{}).length" 2>/dev/null || echo "?")
-PROD=$(npm audit --omit=dev --json 2>/dev/null | node -p "Object.keys(JSON.parse(require('fs').readFileSync(0,'utf8')).vulnerabilities||{}).length" 2>/dev/null || echo "?")
+TOTAL=$(node -e "process.stdout.write(String(Object.keys(JSON.parse(require('fs').readFileSync('$OUT/npm-audit.json','utf8')).vulnerabilities||{}).length))" 2>/dev/null || echo "?")
+PROD=$(npm audit --omit=dev --json 2>/dev/null | node -e "process.stdout.write(String(Object.keys(JSON.parse(require('fs').readFileSync(0,'utf8')).vulnerabilities||{}).length))" 2>/dev/null || echo "?")
 if [ "$PROD" = "0" ]; then ok "0 Meldungen in Laufzeit-Abhängigkeiten ($TOTAL im gesamten Baum, also Bauzeit)"
 else bad "$PROD Meldungen in Laufzeit-Abhängigkeiten"; fi
 
@@ -80,8 +80,8 @@ fi
 step "4/4  SBOM (CycloneDX 1.6)"
 if npx --yes @cyclonedx/cyclonedx-npm --omit dev --spec-version 1.6 --output-file "$OUT/sbom-runtime.cdx.json" >/dev/null 2>&1 &&
    npx --yes @cyclonedx/cyclonedx-npm --spec-version 1.6 --output-file "$OUT/sbom-full.cdx.json" >/dev/null 2>&1; then
-  RT=$(node -p "(JSON.parse(require('fs').readFileSync('$OUT/sbom-runtime.cdx.json','utf8')).components||[]).length")
-  ALL=$(node -p "(JSON.parse(require('fs').readFileSync('$OUT/sbom-full.cdx.json','utf8')).components||[]).length")
+  RT=$(node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync('$OUT/sbom-runtime.cdx.json','utf8')).components||[]).length))")
+  ALL=$(node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync('$OUT/sbom-full.cdx.json','utf8')).components||[]).length))")
   ok "$RT Laufzeit-, $ALL Gesamtkomponenten -> $OUT/"
 else
   bad "SBOM-Erzeugung fehlgeschlagen"

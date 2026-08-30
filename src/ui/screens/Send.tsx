@@ -13,6 +13,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { formatAmount, useT } from '../../i18n';
 import { api, formatRpcError, isRpcTimeout } from '../../messaging/client';
+import { signsOnDevice, startLedgerSigning } from '../ledger-window';
 import { isValidMemoText, memoTextByteLength } from '../../core/stellar/memo';
 import { StrKey } from '@stellar/stellar-sdk';
 import type { Settings } from '../../core/settings';
@@ -61,12 +62,15 @@ export function Send({
 }): ReactNode {
   const { t, locale } = useT();
   const index = accounts.selectedIndex;
+  const account = accounts.accounts.find((a) => a.index === index);
   const balances = useBalances(index, true);
   const invalidate = useInvalidateAccountData();
   const forgetPending = useInvalidatePendingSubmission();
   const markProgress = useMarkUiProgress();
 
   const [stage, setStage] = useState<Stage>('form');
+  /** Set once the Ledger window has taken over; this screen is done. */
+  const [ledgerHandoff, setLedgerHandoff] = useState(false);
   const [destination, setDestination] = useState('');
   const [amount, setAmount] = useState('');
   const [assetId, setAssetId] = useState('native');
@@ -164,6 +168,17 @@ export function Send({
     setBusy(true);
     setError(null);
     try {
+      /**
+       * A hardware account cannot be signed from here: the device is only
+       * reachable from a window context, and this popup closes the moment the
+       * WebHID chooser takes focus. Hand the whole remaining flow — confirm on
+       * device, attach, submit — to the Ledger window and stop here.
+       */
+      if (signsOnDevice(account)) {
+        await startLedgerSigning(xdr, index);
+        setLedgerHandoff(true);
+        return;
+      }
       const signed = await api.signTx(xdr);
       const result = await api.submitTx(signed.signedXdr);
       if (result.outcome === 'unknown') {
@@ -305,14 +320,23 @@ export function Send({
       <div className="flex h-full flex-col">
         <ScreenHeader title={t('confirm.title')} onBack={() => setStage('form')} />
         {error ? <Notice tone="danger">{error}</Notice> : null}
+        {/* The device took over. This screen has nothing left to do, and
+            saying so beats a confirm button that now does nothing. */}
+        {ledgerHandoff ? <Notice tone="info">{t('ledger.send.opening')}</Notice> : null}
         <TxConfirm
           description={description.data}
           mode={settings.mode}
           snapshot={balances.data}
-          busy={busy}
+          busy={busy || ledgerHandoff}
           onConfirm={() => void confirmAndSubmit()}
           onReject={() => setStage('form')}
-          confirmLabel={busy ? t('send.sending') : t('confirm.submit')}
+          confirmLabel={
+            signsOnDevice(account)
+              ? t('ledger.send.route')
+              : busy
+                ? t('send.sending')
+                : t('confirm.submit')
+          }
         />
       </div>
     );

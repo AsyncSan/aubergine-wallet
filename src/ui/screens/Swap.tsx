@@ -15,6 +15,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { formatAmount, useT } from '../../i18n';
 import { api, formatRpcError, isRpcTimeout } from '../../messaging/client';
+import { signsOnDevice, startLedgerSigning } from '../ledger-window';
 import type { Settings } from '../../core/settings';
 import type { RpcResult } from '../../messaging/protocol';
 import {
@@ -69,6 +70,7 @@ export function Swap({
 }): ReactNode {
   const { t, locale } = useT();
   const index = accounts.selectedIndex;
+  const account = accounts.accounts.find((a) => a.index === index);
   const balances = useBalances(index, true);
   const invalidate = useInvalidateAccountData();
   const forgetPending = useInvalidatePendingSubmission();
@@ -77,6 +79,8 @@ export function Swap({
   const isDeveloper = settings.mode === 'developer';
 
   const [stage, setStage] = useState<Stage>('form');
+  /** Set once the Ledger window has taken over; this screen is done. */
+  const [ledgerHandoff, setLedgerHandoff] = useState(false);
   const [sendAssetId, setSendAssetId] = useState('native');
   const [destAssetId, setDestAssetId] = useState<string | null>(null);
   const [amount, setAmount] = useState('');
@@ -239,6 +243,12 @@ export function Swap({
       // is gone once the stage leaves 'confirm'.
       const feeXlm = description.data?.meta.feeXlm ?? null;
       setAccepted((prev) => (prev === null ? prev : { ...prev, feeXlm }));
+      // Same handover as in `Send`: the device is not reachable from a popup.
+      if (signsOnDevice(account)) {
+        await startLedgerSigning(xdr, index);
+        setLedgerHandoff(true);
+        return;
+      }
       const signed = await api.signTx(xdr);
       const result = await api.submitTx(signed.signedXdr);
       if (result.outcome === 'unknown') {
@@ -437,14 +447,31 @@ export function Swap({
       <div className="flex h-full flex-col">
         <ScreenHeader title={t('confirm.title')} onBack={() => setStage('form')} />
         {error ? <Notice tone="danger">{error}</Notice> : null}
+        {/* Same handover notice as in `Send`. */}
+        {ledgerHandoff ? <Notice tone="info">{t('ledger.send.opening')}</Notice> : null}
+        {/**
+          * The aggregator route is a contract call, and the device cannot
+          * render one — `ledger.beginSign` refuses it rather than ask for a
+          * blind signature. Said here, before the button, instead of letting
+          * the user press confirm and meet the refusal.
+          */}
+        {signsOnDevice(account) && accepted?.source === 'soroswap' ? (
+          <Notice tone="warn">{t('ledger.notSupportedSoroban')}</Notice>
+        ) : null}
         <TxConfirm
           description={description.data}
           mode={settings.mode}
           snapshot={balances.data}
-          busy={busy}
+          busy={busy || ledgerHandoff}
           onConfirm={() => void confirmAndSubmit()}
           onReject={() => setStage('form')}
-          confirmLabel={busy ? t('swap.sending') : t('confirm.submit')}
+          confirmLabel={
+            signsOnDevice(account)
+              ? t('ledger.send.route')
+              : busy
+                ? t('swap.sending')
+                : t('confirm.submit')
+          }
           hero={receipt('swap-summary', description.data.meta.feeXlm)}
           allowSoroban={accepted?.source === 'soroswap'}
         />

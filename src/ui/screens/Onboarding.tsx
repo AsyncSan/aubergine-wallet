@@ -22,6 +22,8 @@ import {
   validateMnemonic,
 } from '../../core/crypto/mnemonic';
 import { shuffled } from '../../core/crypto/random';
+import { backupFileName, renderBackupFile } from '../../core/backup-file';
+import { BRAND_NAME } from '../../core/brand';
 import {
   MIN_PASSWORD_SCORE,
   estimatePasswordStrength,
@@ -39,6 +41,7 @@ import {
   TextInput,
 } from '../components/primitives';
 import { Prop3d } from '../components/props3d';
+import { downloadText } from '../download';
 
 type Step = 'welcome' | 'password' | 'phrase' | 'verify' | 'done' | 'import';
 
@@ -106,6 +109,25 @@ export function Onboarding({
   const [bip39Passphrase, setBip39Passphrase] = useState('');
   const [showPassphrase, setShowPassphrase] = useState(false);
   const [revealed, setRevealed] = useState(false);
+  /**
+   * The file backup (phrase step). Three pieces of state rather than one,
+   * because the offer is deliberately a two-step: the button only opens the
+   * warning, and a second, explicit click writes the file. A recovery phrase
+   * landing in the downloads folder is not something anyone should be able to
+   * do by mis-tapping once.
+   */
+  const [fileWarning, setFileWarning] = useState(false);
+  /**
+   * The name the file will get, drawn when the warning opens rather than when
+   * the file is written — so the screen can show it *before* the download.
+   * That matters more than it looks: a name that gives nothing away also gives
+   * the user nothing to search for, and a browser that closes the popup the
+   * moment a download starts would otherwise take the only mention of it with
+   * it. Also carries "a file has been written" for the screen after the click.
+   */
+  const [backupFile, setBackupFile] = useState<string | null>(null);
+  const [fileWritten, setFileWritten] = useState(false);
+  const [fileFailed, setFileFailed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -169,6 +191,36 @@ export function Onboarding({
     } finally {
       setBusy(false);
     }
+  }
+
+  /**
+   * Write the phrase to a file the browser downloads.
+   *
+   * Everything happens in this page: the words are already here (they came
+   * from the one password-gated reveal in `createWallet`), so no new RPC call
+   * and no new copy of the secret is made. The name was drawn when the warning
+   * opened and is passed in, so what the screen promised and what the browser
+   * saves cannot drift apart.
+   */
+  function saveBackupFile(name: string): void {
+    const written = downloadText(
+      name,
+      renderBackupFile(words, {
+        title: t('backupFile.title', { brand: BRAND_NAME }),
+        intro: t('backupFile.intro'),
+        warnings: [
+          t('backupFile.warnSpend'),
+          t('backupFile.warnShare', { brand: BRAND_NAME }),
+          t('backupFile.warnStore'),
+          t('backupFile.warnDelete'),
+        ],
+        wordsHeading: t('backupFile.words'),
+        oneLineHeading: t('backupFile.oneLine'),
+      }),
+    );
+    setFileWarning(false);
+    setFileFailed(!written);
+    setFileWritten(written);
   }
 
   /** A chip was tapped on the verify step. Duplicates count by word, not index. */
@@ -379,6 +431,45 @@ export function Onboarding({
             </span>
           </button>
         )}
+
+        {revealed ? (
+          <div data-testid="phrase-file" className="flex flex-col gap-2">
+            {fileWritten && backupFile ? (
+              <Notice tone="warn">
+                {t('onboarding.phrase.file.saved', { name: backupFile })}
+              </Notice>
+            ) : fileWarning && backupFile ? (
+              <>
+                <Notice tone="danger">{t('onboarding.phrase.file.warning')}</Notice>
+                <Notice tone="info">
+                  {t('onboarding.phrase.file.name', { name: backupFile })}
+                </Notice>
+                <Button tone="danger" onClick={() => saveBackupFile(backupFile)}>
+                  {t('onboarding.phrase.file.confirm')}
+                </Button>
+                <Button tone="ghost" onClick={() => setFileWarning(false)}>
+                  {t('app.cancel')}
+                </Button>
+              </>
+            ) : (
+              <Button
+                tone="secondary"
+                onClick={() => {
+                  setFileFailed(false);
+                  // A fresh name per attempt: two saves are two unrelated
+                  // files, not a visibly numbered pair.
+                  setBackupFile(backupFileName());
+                  setFileWarning(true);
+                }}
+              >
+                {t('onboarding.phrase.file.cta')}
+              </Button>
+            )}
+            {fileFailed ? (
+              <Notice tone="danger">{t('onboarding.phrase.file.failed')}</Notice>
+            ) : null}
+          </div>
+        ) : null}
 
         <Button
           className="mt-auto"

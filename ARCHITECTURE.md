@@ -96,6 +96,24 @@ Arbeit ohne Konflikte garantiert.
    ausschließlich nutzerinitiiert, mit erneuter Passworteingabe, frisch aus dem Keystore
    entschlüsselt. Ohne diese Ausnahme kann der Nutzer kein Backup anlegen. Jeder weitere
    Export-Pfad ist verboten. Die Anzeige blendet sich nach 60 s automatisch aus (v1.3).
+   **Zweite Ausnahme (v1.4):** `wallet.revealSecretKey` gibt den geheimen Schlüssel **eines**
+   Kontos im Stellar-Format (`S…`) an das Popup, unter denselben Bedingungen: nutzerinitiiert,
+   erneute Passworteingabe, frisch aus dem Keystore entschlüsselt (nie aus dem laufenden
+   Keyring, damit ein offen liegengelassenes Popup nichts herausgibt), 60-s-Auto-Hide.
+   Begründung: Ohne sie ist der Wiederherstellungssatz der einzige Export — und der ist die
+   *ganze* Wallet, für immer, inklusive aller künftigen Konten. Der schmalere Export ist der
+   sicherere. Ein Ledger-Konto wird abgelehnt (`NO_SECRET_KEY`), nicht beantwortet: der Seed
+   würde für denselben Pfad einen anderen, funktionslosen Schlüssel liefern. Damit sind es
+   genau zwei Ausnahmen; `tests/protocol.test.ts` und `e2e/specs/12` erzwingen, dass eine
+   dritte nicht unbemerkt dazukommen kann.
+   **Datei-Backup (v1.4):** Der Onboarding-Schritt "Wiederherstellungssatz" bietet an, die
+   Wörter als `.txt` herunterzuladen (`core/backup-file.ts`, `ui/download.ts`). Das ist
+   **kein weiterer Export-Pfad**: geschrieben wird ausschließlich der Satz, den das Popup aus
+   genau dieser einen Ausnahme schon in der Hand hält, im selben Dokument, ohne zusätzlichen
+   RPC-Aufruf und ohne Kopie im Background. Die Bedingungen sind Teil der Invariante: zwei
+   getrennte Klicks (der erste öffnet nur die Warnung), Blob + `<a download>` statt der
+   `downloads`-Berechtigung, und ein zufälliger Dateiname ohne jede Struktur, damit die Datei
+   in einem Download-Ordner nicht ausweist, was sie ist. Automatisch geschrieben wird nie.
 2. Nichts Unverschlüsseltes wird persistiert. `chrome.storage.local` enthält ausschließlich
    den Ciphertext-Blob (`{v, kdf, params, salt, iv, ct}`) plus nicht-sensible Settings.
    **Keystore v2 (v1.3):** Der KDF-Header (`v`, `kdf`, `params`, `salt`) ist als AES-GCM
@@ -126,7 +144,8 @@ Arbeit ohne Konflikte garantiert.
    `messaging/protocol.ts`, also an der Grenze, die der Background tatsächlich prüft. Eine
    Ablehnung dort ist ein `WEAK_PASSWORD` (Längen-Grenzen: `BAD_REQUEST`), kein `ZodError`,
    sonst käme sie nach §6 als `INTERNAL_ERROR` in der UI an. Verifikation eines **bestehenden**
-   Passworts (`wallet.unlock`, `account.add`, `wallet.revealRecoveryPhrase`) bekommt die Regel
+   Passworts (`wallet.unlock`, `account.add`, `wallet.revealRecoveryPhrase`,
+   `wallet.revealSecretKey`) bekommt die Regel
    bewusst nicht: sie würde frühe Nutzer aus der eigenen Wallet aussperren.
 
 **Bedrohungsmodell, das Phase 1 abdeckt:** bösartige Webseite, Phishing-dApp, Diebstahl der
@@ -256,6 +275,52 @@ Bekannte Grenze: Firefox schließt das Extension-Popup, sobald die Credential-Ab
 statt den Nutzer einen stillen Fehlschlag entdecken zu lassen.
 
 ---
+
+### 1.2 Hardware-Signatur mit Ledger (`core/ledger/`, `background/ledger-signing.ts`, 24.08.2026)
+
+**Das Popup ist ein Bote, kein Entscheider.** `navigator.hid` existiert nur in einem Fenster-
+Kontext, nie im MV3-Service-Worker. Die Bytes müssen also durch eine Seite zum Gerät. Der Schnitt,
+der dabei nichts aufweicht:
+
+    Background: alle Prüfungen, gibt die **Signature-Base** heraus
+    Seite:      trägt Bytes zum Gerät und zurück, entscheidet nichts
+    Background: verifiziert, hängt an, gibt das signierte Envelope zurück
+
+Die Seite kann keine Prüfung überspringen, weil sie keine durchführt; sie kann keine Signatur
+fälschen, weil `Transaction.addSignature` gegen den bei der Einrichtung hinterlegten Public Key
+verifiziert; und sie erfährt nichts Neues, weil die Signature-Base aus Envelope und Netz-Passphrase
+berechenbar ist — beides hat sie ohnehin, um es anzuzeigen. Eine Anfrage ist **einmalig**: eine
+Freigabe, höchstens eine Signatur.
+
+**Warum ein eigenes Fenster.** Das Browser-Action-Popup schließt bei Fokusverlust — und den nimmt
+sowohl der WebHID-Geräteauswahldialog als auch der Nutzer, der sich dem Gerät zuwendet. Ein
+schließendes Popup reißt seinen HID-Transport mitten in der Zeremonie mit. `entrypoints/ledger/`
+ist deshalb eine echte Fensterseite. Sie bekommt nur eine Request-ID über die URL; das Envelope
+holt sie per RPC, damit nichts davon in Verlauf oder Fenstertitel landet.
+
+**Zwei Schlüsselquellen, ein Slot-Raum (Vault v2).** Bis v1 *war* ein Konto sein SEP-0005-Index. Ein
+Hardware-Konto bricht das: sein Schlüssel ist hier nicht ableitbar, und seine Pfadposition liegt
+auf der Leiter des Geräts. v2 trennt beide Bedeutungen — `index` ist die wallet-weite Slot-ID
+(das, was jedes bestehende RPC adressiert), `derivationIndex` die BIP-Position, **pro Quelle**
+fortlaufend. Letzteres ist keine Kosmetik: würde ein eingefügtes Ledger-Konto das nächste
+Seed-Konto von `m/44'/148'/1'` verdrängen, wäre die Wallet aus ihrer eigenen Recovery-Phrase nicht
+mehr rekonstruierbar. Die Migration setzt `derivationIndex = index` — die eine Zeile, die
+garantiert, dass kein bestehendes Konto seinen Schlüssel wechselt.
+
+**Die Falle, die einen eigenen Test hat.** Der Seed *kann* für `m/44'/148'/0'` einen Schlüssel
+ableiten, und das ist nicht der des Geräts. Ohne die Verweigerung in `Keyring.signTransaction`
+erzeugte die Wallet eine gültige Signatur mit dem falschen Schlüssel, meldete Erfolg und scheiterte
+on-chain mit `tx_bad_auth`. `LEDGER_REQUIRED` ist deshalb sowohl Routing-Antwort als auch Sperre.
+
+**Kein Blind-Signing.** Die Stellar-App kann einen Contract-Aufruf nicht darstellen; ihn zu
+signieren hieße, auf dem Gerät einen nackten Hash zu bestätigen. Genau das lehnt §5 überall sonst
+ab, also kommt es auch nicht durch die Hardware-Tür: `ledger.beginSign` verweigert Soroban.
+
+Grenzen dieser Fassung: Chrome-only (Firefox hat kein WebHID und will keins), klassische
+Operationen only, und eine Webseite kann von einem Ledger-Konto keine Signatur anfordern. Tests:
+`tests/ledger.test.ts` gegen `tests/support/fake-ledger.ts`, das echte ed25519-Signaturen über den
+Transaktions-Hash liefert — verifiziert damit jeden Schritt außer dem Gerät selbst.
+**Gegen echte Hardware noch nicht getestet.**
 
 ### 5.1 Soroban-Aufrufe (`core/stellar/soroban-describe.ts`, 20.08.2026)
 

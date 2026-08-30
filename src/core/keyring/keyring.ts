@@ -11,13 +11,33 @@ import type { Keypair, Transaction } from '@stellar/stellar-sdk';
 import { AppError } from '../errors';
 import { deriveStellarKeypair, mnemonicToSeed, validateMnemonic } from '../crypto/mnemonic';
 import { zeroize } from '../crypto/zeroize';
-import { toPublicAccount, type AccountMeta, type PublicAccount, type Vault } from './account';
+import {
+  toPublicAccount,
+  type AccountMeta,
+  type LedgerAccountMeta,
+  type PublicAccount,
+  type Vault,
+} from './account';
 
 interface UnlockedState {
   seed: Uint8Array;
-  /** Public keys by SEP-0005 index; derived once at unlock. */
+  /**
+   * Public keys by account *slot*, resolved once at unlock.
+   *
+   * For a seed account the value is derived from {@link UnlockedState.seed};
+   * for a Ledger account it is the key recorded at enrolment, because there is
+   * nothing here to derive it from. The map is the single answer to "which key
+   * is slot n", so nothing downstream has to care which of the two it was.
+   */
   publicKeys: Map<number, string>;
   accounts: AccountMeta[];
+}
+
+/** What enrolling a hardware account needs; no secret, by construction. */
+export interface LedgerEnrolment {
+  readonly label: string;
+  readonly derivationIndex: number;
+  readonly publicKey: string;
 }
 
 export class Keyring {
@@ -43,7 +63,13 @@ export class Keyring {
     const publicKeys = new Map<number, string>();
     try {
       for (const account of vault.accounts) {
-        const kp = await deriveStellarKeypair(seed, account.index);
+        if (account.source === 'ledger') {
+          // Nothing to derive: the key came from the device at enrolment and
+          // the vault is its only copy here.
+          publicKeys.set(account.index, account.publicKey);
+          continue;
+        }
+        const kp = await deriveStellarKeypair(seed, account.derivationIndex);
         publicKeys.set(account.index, kp.publicKey());
       }
     } catch (err) {
@@ -96,18 +122,82 @@ export class Keyring {
     throw new AppError('BAD_REQUEST', 'unknown public key');
   }
 
-  /** Derive and remember an additional account. Returns its public form. */
+  /** Metadata for one slot, so a caller can branch on where its key lives. */
+  accountMeta(index: number): AccountMeta {
+    const meta = this.#require().accounts.find((a) => a.index === index);
+    if (!meta) throw new AppError('BAD_REQUEST', `unknown account index ${index}`);
+    return meta;
+  }
+
+  /** The next free wallet-wide slot id. Never reuses a retired one. */
+  #nextSlot(state: UnlockedState): number {
+    return state.accounts.reduce((max, a) => Math.max(max, a.index), -1) + 1;
+  }
+
+  /**
+   * The next free path position *within one key source*.
+   *
+   * Per source, not global: the seed ladder and the device ladder are separate
+   * key spaces, and letting an added Ledger account push the next seed account
+   * from `m/44'/148'/1'` to `m/44'/148'/2'` would make the wallet's own
+   * accounts unrecoverable from the recovery phrase alone in any other wallet.
+   */
+  #nextDerivationIndex(state: UnlockedState, source: AccountMeta['source']): number {
+    return (
+      state.accounts
+        .filter((a) => a.source === source)
+        .reduce((max, a) => Math.max(max, a.derivationIndex), -1) + 1
+    );
+  }
+
+  /** Derive and remember an additional seed account. Returns its public form. */
   async addAccount(label: string): Promise<PublicAccount> {
     const state = this.#require();
-    const nextIndex = state.accounts.reduce((max, a) => Math.max(max, a.index), -1) + 1;
-    const kp = await deriveStellarKeypair(state.seed, nextIndex);
+    const index = this.#nextSlot(state);
+    const derivationIndex = this.#nextDerivationIndex(state, 'seed');
+    const kp = await deriveStellarKeypair(state.seed, derivationIndex);
     // Same window as in signTransaction: a lock during the derivation would
     // otherwise register an account derived from a zeroized seed.
     if (this.#state !== state) throw new AppError('WALLET_LOCKED');
-    const meta: AccountMeta = { index: nextIndex, label };
+    const meta: AccountMeta = { index, label, source: 'seed', derivationIndex };
     state.accounts.push(meta);
-    state.publicKeys.set(nextIndex, kp.publicKey());
+    state.publicKeys.set(index, kp.publicKey());
     return toPublicAccount(meta, kp.publicKey());
+  }
+
+  /**
+   * Remember an account whose key lives on a hardware device.
+   *
+   * Nothing is derived and nothing secret arrives: the caller has already
+   * asked the device for this path and is handing back the answer. The two
+   * checks here are what keep the vault honest — the same key must not be
+   * enrolled twice under two slots (which would let the wallet believe it has
+   * two accounts and produce two envelopes against one sequence number), and
+   * the same device path must not be enrolled twice for the same reason.
+   */
+  addLedgerAccount(enrolment: LedgerEnrolment): PublicAccount {
+    const state = this.#require();
+    for (const existing of state.publicKeys.values()) {
+      if (existing === enrolment.publicKey) {
+        throw new AppError('BAD_REQUEST', 'this account is already in the wallet');
+      }
+    }
+    const pathTaken = state.accounts.some(
+      (a) => a.source === 'ledger' && a.derivationIndex === enrolment.derivationIndex,
+    );
+    if (pathTaken) {
+      throw new AppError('BAD_REQUEST', 'this device path is already in the wallet');
+    }
+    const meta: LedgerAccountMeta = {
+      index: this.#nextSlot(state),
+      label: enrolment.label,
+      source: 'ledger',
+      derivationIndex: enrolment.derivationIndex,
+      publicKey: enrolment.publicKey,
+    };
+    state.accounts.push(meta);
+    state.publicKeys.set(meta.index, meta.publicKey);
+    return toPublicAccount(meta, meta.publicKey);
   }
 
   /**
@@ -145,9 +235,21 @@ export class Keyring {
     if (expectedPublicKey === undefined) {
       throw new AppError('BAD_REQUEST', `unknown account index ${accountIndex}`);
     }
+    const meta = this.accountMeta(accountIndex);
+    /**
+     * A hardware account has no key here, and the seed *would* happily produce
+     * one for the same path. That is the trap this line closes: deriving
+     * `m/44'/148'/n'` from the recovery phrase for an account the user enrolled
+     * from a device yields a valid signature by a completely different key,
+     * reported as success and failing on chain with `tx_bad_auth`. Refuse, and
+     * let the caller route to the device.
+     */
+    if (meta.source === 'ledger') {
+      throw new AppError('LEDGER_REQUIRED', `account ${accountIndex} signs on a device`);
+    }
     let kp: Keypair | null = null;
     try {
-      kp = await deriveStellarKeypair(state.seed, accountIndex);
+      kp = await deriveStellarKeypair(state.seed, meta.derivationIndex);
       /**
        * Derivation is four awaited HMAC round trips. `lock()` zeroizes the very
        * buffer we are deriving from, in place, so a lock landing inside that

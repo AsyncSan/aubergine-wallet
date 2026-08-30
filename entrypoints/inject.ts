@@ -34,6 +34,7 @@ const ERROR_MESSAGES: Readonly<Record<string, string>> = {
   BAD_REQUEST: 'The request was malformed.',
   NETWORK_ERROR: 'The wallet could not reach the network.',
   UNSUPPORTED_OPERATION: 'The wallet does not support this operation yet.',
+  LEDGER_REQUIRED: 'This account signs on a hardware device, which this wallet does not offer to web pages.',
   INTERNAL_ERROR: 'The wallet hit an unexpected error.',
   TIMEOUT: 'The wallet did not answer in time.',
 };

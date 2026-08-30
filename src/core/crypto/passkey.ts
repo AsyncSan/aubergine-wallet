@@ -62,7 +62,16 @@ export const HKDF_SALT_BYTES = 16;
 
 export const PASSKEY_RECORD_VERSION = 1;
 
-const base64 = z.string().regex(/^[A-Za-z0-9+/]+={0,2}$/u, 'not base64');
+/**
+ * Base64 as this module writes it. Exported because the protocol boundary has
+ * to hold the popup to the same shape: a `credentialId` that is not base64
+ * used to be accepted by `passkey.enable`, get written, and then fail
+ * `passkeyRecordSchema` on the way back in, so the enrolment reported success
+ * and silently did not exist. Rejecting it at the door makes that loud.
+ */
+export const base64String = z.string().regex(/^[A-Za-z0-9+/]+={0,2}$/u, 'not base64');
+
+const base64 = base64String;
 
 const wrappedSchema = z.object({
   hkdfSalt: base64,

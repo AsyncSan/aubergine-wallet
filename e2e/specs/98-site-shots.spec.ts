@@ -142,6 +142,24 @@ for (const { locale, theme } of MATRIX) {
     await expect(popup.getByTestId('receive-qr')).toBeVisible();
     await shot('receive');
 
+    /* ----------------------------- 3b · swap quote with the route on screen */
+    // The DEX path finder is mocked at a flat rate, so the quote card, the
+    // route line and the guaranteed minimum are all on screen together. This
+    // is the one screen that shows where a swap is actually routed, which is
+    // the whole reason the store listing needs it.
+    horizon.pathRate = 0.5;
+    await reloadPopup(popup);
+    await expect(popup.getByTestId('balance-hero')).toBeVisible();
+    await popup.getByTestId('action-swap').click();
+    await expect(popup.getByRole('heading', { name: t('swap.title') })).toBeVisible();
+    await popup.locator('input[inputmode="decimal"]').fill('10');
+    // The quote arrives live; wait for the derived floor rather than a timeout,
+    // because an empty minimum is exactly the frame that must not ship.
+    await expect(popup.getByTestId('swap-quote')).toBeVisible();
+    await expect(popup.getByTestId('swap-dest-min')).not.toBeEmpty();
+    await expect(popup.getByTestId('swap-source')).toContainText(t('swap.viaDex'));
+    await shot('swap-quote');
+
     /* ------------------------------------ 4 · developer mode, XDR expanded */
     // Straight through the settings store: the UI path needs an answer to
     // chrome.permissions.request(), which no automated browser can give.
@@ -189,7 +207,7 @@ test('every site screenshot exists', async () => {
   const { access } = await import('node:fs/promises');
   const missing: string[] = [];
   for (const { locale, theme } of MATRIX) {
-    for (const name of ['home', 'confirm-warning', 'receive', 'developer-xdr']) {
+    for (const name of ['home', 'confirm-warning', 'receive', 'swap-quote', 'developer-xdr']) {
       const file = `${OUT}/${name}-${locale}-${theme}.png`;
       await access(file).catch(() => missing.push(file));
     }

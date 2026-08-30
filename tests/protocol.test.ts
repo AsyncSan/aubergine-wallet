@@ -3,6 +3,7 @@
  * discriminated union, typed error codes instead of raw exception strings.
  */
 import { describe, expect, it } from 'vitest';
+import { Keypair } from '@stellar/stellar-sdk';
 import {
   RPC_METHODS,
   isRpcMethod,
@@ -55,19 +56,94 @@ describe('RPC method table', () => {
     expect(isRpcMethod('toString')).toBe(false);
   });
 
-  it('never exposes a method that hands out secret key material', () => {
-    // Invariant 1. `wallet.revealRecoveryPhrase` is the one audited, password
-    // gated exception and is asserted separately below.
+  /**
+   * Invariant 1, as a tripwire rather than a claim: any method whose *name*
+   * suggests it hands out key material has to be one of the two audited,
+   * password-gated exceptions. A third one added later fails here, which is
+   * the point — this file is where that decision has to be made consciously.
+   */
+  it('exposes no key-material method beyond the two audited exceptions', () => {
     const suspicious = RPC_METHODS.filter((m) =>
       /secret|privateKey|seed|export/iu.test(m),
     );
-    expect(suspicious).toEqual([]);
+    expect(suspicious).toEqual(['wallet.revealSecretKey']);
+    // The phrase reveal does not match the pattern above, so it is named here
+    // explicitly; both are asserted to be password-gated below.
+    expect(RPC_METHODS).toContain('wallet.revealRecoveryPhrase');
+  });
+
+  /**
+   * The wire boundary for hardware accounts. `ledger.addAccount` is the one
+   * place a public key enters the vault from outside the background, so the
+   * schema is what stops a malformed value from being recorded as the key
+   * every future signature is checked against.
+   */
+  it('only accepts a strkey public key when enrolling a device account', () => {
+    const schema = rpcSchemas['ledger.addAccount'].params;
+    const valid = {
+      password: 'hunter2!',
+      derivationIndex: 0,
+      publicKey: 'GBAW5XGWORWVFE2XTJYDTLDHXTY2Q2MO73HYCGB3XMFMQ562Q2W2GJQX',
+      label: '',
+    };
+    expect(schema.safeParse(valid).success).toBe(true);
+    // A secret key is the one that would be catastrophic to wave through.
+    expect(
+      schema.safeParse({
+        ...valid,
+        publicKey: 'SBGWSG6BTNCKCOB3DIFBGCVMUPQFYPA2G4O34RMTB343OYPXU5DJDVMN',
+      }).success,
+    ).toBe(false);
+    expect(schema.safeParse({ ...valid, publicKey: 'not a key' }).success).toBe(false);
+    expect(schema.safeParse({ ...valid, derivationIndex: -1 }).success).toBe(false);
+    expect(schema.safeParse({ ...valid, derivationIndex: 1.5 }).success).toBe(false);
+    // Unbounded indexes would produce an account no other wallet looks for.
+    expect(schema.safeParse({ ...valid, derivationIndex: 100_000 }).success).toBe(false);
   });
 
   it('password-gates the recovery phrase reveal', () => {
     const schema = rpcSchemas['wallet.revealRecoveryPhrase'].params;
     expect(schema.safeParse({}).success).toBe(false);
     expect(schema.safeParse({ password: 'hunter2!' }).success).toBe(true);
+  });
+
+  it('password-gates the secret key reveal and demands one account', () => {
+    const schema = rpcSchemas['wallet.revealSecretKey'].params;
+    expect(schema.safeParse({}).success).toBe(false);
+    // No account index means "the wallet", which is exactly the confusion this
+    // method exists to avoid: one call, one account.
+    expect(schema.safeParse({ password: 'hunter2!' }).success).toBe(false);
+    expect(schema.safeParse({ accountIndex: 0 }).success).toBe(false);
+    expect(schema.safeParse({ password: 'hunter2!', accountIndex: 0 }).success).toBe(true);
+    expect(schema.safeParse({ password: 'hunter2!', accountIndex: -1 }).success).toBe(false);
+    expect(schema.safeParse({ password: 'hunter2!', accountIndex: 1.5 }).success).toBe(false);
+  });
+
+  /**
+   * The result schema is the last line of defence on the way *out*: a
+   * derivation that silently produced something else must not reach the screen
+   * that tells the user "this is your key".
+   */
+  it('only lets a well-formed Stellar secret key through the result schema', () => {
+    const schema = rpcSchemas['wallet.revealSecretKey'].result;
+    const kp = Keypair.random();
+    expect(
+      schema.safeParse({
+        secretKey: kp.secret(),
+        publicKey: kp.publicKey(),
+        path: "m/44'/148'/0'",
+      }).success,
+    ).toBe(true);
+    for (const bad of ['', 'not a key', kp.publicKey()]) {
+      expect(
+        schema.safeParse({
+          secretKey: bad,
+          publicKey: kp.publicKey(),
+          path: "m/44'/148'/0'",
+        }).success,
+        bad,
+      ).toBe(false);
+    }
   });
 });
 
@@ -110,6 +186,36 @@ describe('parseRequest', () => {
     ).toThrow();
     expect(() =>
       parseRequest({ id: 'a1', method: 'account.history', params: { limit: 1000 } }),
+    ).toThrow();
+  });
+
+  /**
+   * Regression: `passkey.enable` used to take any non-empty string. A
+   * `credentialId` that is not base64 passed the boundary, was written, and
+   * then failed `passkeyRecordSchema` when the record was read back, so the
+   * enrolment answered `ok` and silently did not exist. Caught by the e2e
+   * invariant spec, fixed at the boundary.
+   */
+  it('rejects passkey material that is not base64', () => {
+    const valid = {
+      password: 'correct horse battery staple',
+      credentialId: 'AQIDBA==',
+      prfSalt: 'AQIDBA==',
+      prfOutput: 'AQIDBA==',
+    };
+    expect(() => parseRequest({ id: 'a1', method: 'passkey.enable', params: valid })).not.toThrow();
+    for (const field of ['credentialId', 'prfSalt', 'prfOutput'] as const) {
+      expect(() =>
+        parseRequest({
+          id: 'a1',
+          method: 'passkey.enable',
+          params: { ...valid, [field]: 'not base64!' },
+        }),
+        `${field} accepted a non-base64 value`,
+      ).toThrow();
+    }
+    expect(() =>
+      parseRequest({ id: 'a1', method: 'passkey.unlock', params: { prfOutput: 'not base64!' } }),
     ).toThrow();
   });
 
@@ -407,6 +513,12 @@ describe('the vault-creation password floor is enforced at the RPC edge', () => 
     for (const method of ['wallet.unlock', 'wallet.revealRecoveryPhrase'] as const) {
       expect(rpcSchemas[method].params.safeParse({ password: 'password' }).success).toBe(true);
     }
+    expect(
+      rpcSchemas['wallet.revealSecretKey'].params.safeParse({
+        password: 'password',
+        accountIndex: 0,
+      }).success,
+    ).toBe(true);
     expect(
       rpcSchemas['account.add'].params.safeParse({ password: 'password', label: 'x' }).success,
     ).toBe(true);

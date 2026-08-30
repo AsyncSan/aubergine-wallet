@@ -198,11 +198,12 @@ describe('keyring lock races', () => {
     const mnemonic = generateMnemonic(128);
     await expect(
       keyring.unlock({
-        version: 1,
+        version: 2,
         mnemonic,
         // A non-integer index makes SEP-0005 derivation throw after the seed
-        // has already been produced.
-        accounts: [{ index: 1.5, label: '' }],
+        // has already been produced. Constructed directly rather than through
+        // `vaultSchema`, which would reject it long before the keyring sees it.
+        accounts: [{ index: 1.5, label: '', source: 'seed', derivationIndex: 1.5 }],
       }),
     ).rejects.toBeDefined();
     const seed = seenSeeds[seenSeeds.length - 1];

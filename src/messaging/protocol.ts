@@ -7,14 +7,21 @@
  * instead of half-executing.
  *
  * Note on invariant 1: no result type in this file contains a secret key or a
- * seed. The single exception is `wallet.revealRecoveryPhrase`, which is
- * password-gated, explicitly user-initiated and exists because the user must be
- * able to write their recovery phrase down. Everything else that needs a key
- * (signing) happens inside the background.
+ * seed. There are exactly two exceptions, both password-gated, both explicitly
+ * user-initiated, and both existing for the same reason — this is a
+ * self-custody wallet, and a key the owner cannot get out of it is not
+ * self-custody:
+ *
+ *   - `wallet.revealRecoveryPhrase`, so the phrase can be written down,
+ *   - `wallet.revealSecretKey`, so one account's key can be used with another
+ *     Stellar tool (the phrase would hand over *every* account instead).
+ *
+ * Everything else that needs a key (signing) happens inside the background.
  */
 import { z } from 'zod';
 import { AppError, ERROR_CODES } from '../core/errors';
-import { accountMetaSchema } from '../core/keyring/account';
+import { publicAccountSchema, publicKeyStrkey } from '../core/keyring/account';
+import { base64String } from '../core/crypto/passkey';
 import { MIN_PASSWORD_SCORE, estimatePasswordStrength } from '../core/password-strength';
 import { httpsEndpointSchema, settingsPatchSchema, settingsSchema } from '../core/settings';
 import { checkSorobanEndpoint } from '../core/stellar/networks';
@@ -22,9 +29,33 @@ import { MEMO_TEXT_MAX_BYTES, isValidMemoText } from '../core/stellar/memo';
 
 /* ------------------------------------------------------------------ shared */
 
-const publicAccountSchema = accountMetaSchema.extend({
-  publicKey: z.string(),
-  path: z.string(),
+
+/**
+ * Highest BIP path position the wallet will enrol from a device.
+ *
+ * The Ledger account chooser walks the first few paths; anything beyond this
+ * is a typo or a script, and an account nothing else will look for.
+ */
+export const MAX_LEDGER_DERIVATION_INDEX = 255;
+
+/**
+ * An open hardware signing request as the Ledger window sees it.
+ *
+ * Note what it carries and what it does not: the envelope and the exact bytes
+ * to sign, so the window can show the user what they are approving and hand
+ * the device its payload — and no key material, because there is none in this
+ * flow to leak.
+ */
+const ledgerSignRequestSchema = z.object({
+  requestId: z.string().min(1),
+  accountIndex: z.number().int().min(0),
+  derivationIndex: z.number().int().min(0),
+  publicKey: publicKeyStrkey,
+  xdr: z.string().min(1),
+  networkPassphrase: z.string().min(1),
+  /** Base64 of the signature base: network id hash + envelope type + tx. */
+  signatureBase: base64String.min(1),
+  expiresAt: z.number().int().positive(),
 });
 
 const i18nMessageSchema = z.object({
@@ -350,6 +381,44 @@ export const rpcSchemas = {
       bip39Passphrase: z.string().nullable(),
     }),
   },
+  /**
+   * One account's SEP-0005 key in strkey form (`S…`), the second and last
+   * exception to invariant 1.
+   *
+   * Per account, not per wallet: the recovery phrase is the whole wallet
+   * forever, so a user who needs to move *one* account into another Stellar
+   * tool is otherwise pushed into handing over everything, including every
+   * account they add in the future. The narrower export is the safer one, and
+   * a wallet that refuses to offer it does not stop the user, it only makes
+   * the phrase the thing they paste into a stranger's website.
+   *
+   * The password is required even while the wallet is unlocked: the handler
+   * decrypts the keystore from scratch rather than reading the live keyring,
+   * so an unattended open popup cannot give a key away.
+   */
+  'wallet.revealSecretKey': {
+    params: z.object({
+      password: z.string().min(1),
+      /** Wallet-wide slot id, the same number `account.select` takes. */
+      accountIndex: z.number().int().min(0),
+    }),
+    result: z.object({
+      /**
+       * Stellar strkey secret seed. Shape-checked here for the same reason
+       * `publicKeyStrkey` is: a result that does not look like a key means the
+       * derivation went wrong, and shipping it to the UI would put a value the
+       * user cannot use in front of them as if it were their key.
+       */
+      secretKey: z.string().regex(/^S[A-Z2-7]{55}$/u, 'not a Stellar secret key'),
+      /**
+       * The public key this secret belongs to, and the derivation path.
+       * Returned so the screen can show them together: the user's own check
+       * that they are looking at the account they meant.
+       */
+      publicKey: publicKeyStrkey,
+      path: z.string(),
+    }),
+  },
   'wallet.reset': {
     params: z.object({ confirm: z.literal(true) }),
     result: emptySchema,
@@ -624,9 +693,15 @@ export const rpcSchemas = {
   'passkey.enable': {
     params: z.object({
       password: z.string().min(1),
-      credentialId: z.string().min(1),
-      prfSalt: z.string().min(1),
-      prfOutput: z.string().min(1),
+      /**
+       * All three are base64 here, not merely non-empty: they end up in a
+       * `passkeyRecord`, which validates them again on the way back out. A
+       * value that passes here and fails there is an enrolment that reports
+       * success and does not exist.
+       */
+      credentialId: base64String.min(1),
+      prfSalt: base64String.min(1),
+      prfOutput: base64String.min(1),
     }),
     result: emptySchema,
   },
@@ -635,8 +710,79 @@ export const rpcSchemas = {
     result: emptySchema,
   },
   'passkey.unlock': {
-    params: z.object({ prfOutput: z.string().min(1) }),
+    params: z.object({ prfOutput: base64String.min(1) }),
     result: z.object({ accounts: z.array(publicAccountSchema) }),
+  },
+  /* ---------------------------------------------------------- hardware */
+
+  /**
+   * Enrol an account whose key lives on a Ledger.
+   *
+   * The public key arrives from the caller because only a window context can
+   * talk to the device (`navigator.hid` does not exist in a service worker).
+   * That is safe in a way worth stating: a wrong key here does not create a
+   * signing capability, it creates an account that can never sign, because
+   * every later signature is verified against exactly this value before it is
+   * attached. The password is required for the same reason `account.add`
+   * requires it — the vault has to be re-encrypted.
+   */
+  'ledger.addAccount': {
+    params: z.object({
+      password: z.string().min(1),
+      /**
+       * Capped rather than unbounded: the device UI enumerates a handful of
+       * accounts, and an absurd index would silently produce an account whose
+       * path no other wallet would ever look at.
+       */
+      derivationIndex: z.number().int().min(0).max(MAX_LEDGER_DERIVATION_INDEX),
+      publicKey: publicKeyStrkey,
+      label: z.string().max(64).default(''),
+    }),
+    result: z.object({ account: publicAccountSchema }),
+  },
+  /**
+   * Run every signing guard and hand out the bytes the device must sign.
+   *
+   * Same body as `tx.sign` up to the point where a key would be needed
+   * (`authoriseSigning`), so a hardware signature is subject to the
+   * developer-mode gate and the open-submission lock on identical terms.
+   */
+  'ledger.beginSign': {
+    params: z.object({
+      xdr: z.string().min(1),
+      accountIndex: z.number().int().min(0).optional(),
+    }),
+    result: ledgerSignRequestSchema,
+  },
+  /**
+   * Re-read an open request.
+   *
+   * The Ledger window is opened with a request id in its URL and has no other
+   * way to learn what it is about; it must not be handed the envelope through
+   * the URL, where it would sit in history and in the window title.
+   */
+  'ledger.signRequest': {
+    params: z.object({ requestId: z.string().min(1) }),
+    result: ledgerSignRequestSchema,
+  },
+  /**
+   * Attach a device signature and return the signed envelope.
+   *
+   * `Transaction.addSignature` verifies against the enrolled public key, so a
+   * signature from a different device, a different path or a tampered page is
+   * rejected here rather than discovered on chain as `tx_bad_auth`.
+   */
+  'ledger.completeSign': {
+    params: z.object({
+      requestId: z.string().min(1),
+      /** Raw ed25519 signature, 64 bytes, base64. */
+      signature: base64String.min(1),
+    }),
+    result: z.object({ signedXdr: z.string() }),
+  },
+  'ledger.cancelSign': {
+    params: z.object({ requestId: z.string().min(1) }),
+    result: emptySchema,
   },
 } as const;
 

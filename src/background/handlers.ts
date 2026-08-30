@@ -28,9 +28,16 @@ import {
 } from '../core/crypto/passkey';
 import { randomBytes } from '../core/crypto/kdf';
 import { zeroize } from '../core/crypto/zeroize';
-import { generateMnemonic, normalizeMnemonic, validateMnemonic } from '../core/crypto/mnemonic';
+import {
+  deriveStellarKeypair,
+  generateMnemonic,
+  mnemonicToSeed,
+  normalizeMnemonic,
+  stellarAccountPath,
+  validateMnemonic,
+} from '../core/crypto/mnemonic';
 import { Keyring } from '../core/keyring/keyring';
-import { vaultSchema, type PublicAccount, type Vault } from '../core/keyring/account';
+import { newVault, vaultSchema, type PublicAccount, type Vault } from '../core/keyring/account';
 import {
   DEFAULT_SETTINGS,
   effectiveNetworkId,
@@ -83,6 +90,7 @@ import {
   type TxDescription,
 } from '../core/stellar/tx-describe';
 import type { RpcMethod, RpcParams, RpcResult } from '../messaging/protocol';
+import { LedgerSignQueue } from './ledger-signing';
 import { AutoLock } from './autolock';
 import { UnlockGuard } from './unlock-guard';
 import {
@@ -120,6 +128,13 @@ interface CachedSoroswapQuote {
 export class BackgroundContext {
   readonly keyring = new Keyring();
   readonly prompts = new PromptQueue();
+  /**
+   * Hardware signatures the wallet has authorised but not yet received.
+   *
+   * Lives next to `prompts` because it has the same lifetime rule: both hold
+   * an authorisation the user has given, and both are dropped on lock.
+   */
+  readonly ledgerSigns = new LedgerSignQueue();
   readonly unlockGuard = new UnlockGuard();
   readonly autoLock: AutoLock;
   /** Optional at runtime: absent key -> DEX-only quotes, feature off. */
@@ -177,6 +192,7 @@ export class BackgroundContext {
     this.autoLock = new AutoLock(DEFAULT_SETTINGS.autoLockMinutes, () => {
       this.keyring.lock();
       this.prompts.rejectAll();
+      this.ledgerSigns.clear();
     });
   }
 
@@ -631,6 +647,64 @@ async function feeForBuild(
   return chooseFee(await fetchFeeStats(network), operationCount).perOperationStroops;
 }
 
+/**
+ * Everything that has to be true before *any* signature is produced.
+ *
+ * Extracted so the hardware path cannot drift from the software one. It used
+ * to live inline in `tx.sign`; a second signing entry point that reimplemented
+ * "most of" these checks is precisely the bug this shape prevents, because
+ * there is now one body and both callers are in it.
+ *
+ * Returns the parsed transaction and the resolved account slot. It does not
+ * sign, and it does not know how the signature will be produced.
+ */
+async function authoriseSigning(
+  ctx: BackgroundContext,
+  xdr: string,
+  requestedIndex: number | undefined,
+): Promise<{ tx: Transaction; index: number; network: NetworkConfig }> {
+  await ctx.autoLock.touch();
+  const settings = await ctx.settings();
+  const network = await ctx.network();
+  const index = await ctx.resolveIndex(requestedIndex);
+  let tx: Transaction;
+  try {
+    const parsed = TransactionBuilder.fromXDR(xdr, network.passphrase);
+    if ('innerTransaction' in parsed) {
+      throw new AppError('UNSUPPORTED_OPERATION', 'fee-bump signing is not supported yet');
+    }
+    tx = parsed;
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    throw new AppError('BAD_REQUEST', 'malformed transaction envelope');
+  }
+  // §4 row 3 (refined): *external* contract calls are a developer-mode
+  // capability, enforced here as well as in the UI, so a tampered popup
+  // cannot reach it either. The one exception is a swap envelope this
+  // background built itself via the aggregator: its hash was allow-listed at
+  // build time and grants exactly one signature (wallet-internal exception).
+  if (isSorobanTransaction(tx) && settings.mode !== 'developer') {
+    const isInternalSwap = ctx.consumeInternalSoroban(tx.hash().toString('hex'));
+    if (!isInternalSwap) {
+      throw new AppError('DEVELOPER_MODE_REQUIRED', 'soroban invocation in beginner mode');
+    }
+  }
+  /**
+   * Second call site (B2). A signature *is* the authorisation, an envelope
+   * built before the first submission went open, or one handed in from
+   * anywhere else, becomes spendable the moment it is signed, and the popup
+   * is not the only thing that can call this. Both the account that signs and
+   * the account the envelope draws its sequence number from are checked; the
+   * envelope in hand is exempt, because signing the very same bytes twice
+   * produces the same transaction, not a second one.
+   */
+  await ctx.assertNoOpenSubmission({
+    accounts: accountsBoundBy(ctx, tx.source, index),
+    envelopeHash: tx.hash().toString('hex'),
+  });
+  return { tx, index, network };
+}
+
 /* ------------------------------------------------------------ handlers */
 
 export const handlers: HandlerMap = {
@@ -640,11 +714,7 @@ export const handlers: HandlerMap = {
     if (await keystoreIsUnreadable()) throw new AppError('KEYSTORE_UNREADABLE');
     if (await hasKeystore()) throw new AppError('WALLET_EXISTS');
     const mnemonic = generateMnemonic(params.strength);
-    const vault: Vault = {
-      version: 1,
-      mnemonic,
-      accounts: [{ index: 0, label: '' }],
-    };
+    const vault: Vault = newVault(mnemonic);
     await ctx.persistVault(vault, params.password);
     return { accounts: await unlockInto(ctx, vault) };
   },
@@ -657,14 +727,7 @@ export const handlers: HandlerMap = {
     // Finding 7: the BIP-39 passphrase is part of the derivation. It is stored
     // with the phrase and fed into `mnemonicToSeed` on every unlock, so a
     // 25th-word wallet restores to the accounts the user expects.
-    const vault: Vault = {
-      version: 1,
-      mnemonic,
-      ...(params.bip39Passphrase === undefined || params.bip39Passphrase === ''
-        ? {}
-        : { bip39Passphrase: params.bip39Passphrase }),
-      accounts: [{ index: 0, label: '' }],
-    };
+    const vault: Vault = newVault(mnemonic, params.bip39Passphrase);
     await ctx.persistVault(vault, params.password);
     return { accounts: await unlockInto(ctx, vault) };
   },
@@ -692,6 +755,7 @@ export const handlers: HandlerMap = {
   'wallet.lock': async (ctx) => {
     ctx.keyring.lock();
     ctx.prompts.rejectAll();
+    ctx.ledgerSigns.clear();
     await ctx.autoLock.cancel();
     return {};
   },
@@ -718,9 +782,48 @@ export const handlers: HandlerMap = {
     };
   },
 
+  /**
+   * One account's secret key, the second and last exception to invariant 1.
+   *
+   * Built from the vault the password just decrypted, not from the live
+   * keyring — deliberately, and for two separate reasons. The keyring holds no
+   * method that returns key material (a unit test asserts its surface stays
+   * that way), and decrypting from scratch means an unlocked wallet left open
+   * on a desk still cannot be made to give a key away.
+   *
+   * A hardware account is refused rather than answered. The seed *would*
+   * happily derive a key for the same path, and handing that over would be
+   * worse than useless: it is a different key than the one on the device, so
+   * the user would be told "here is your account's key" about an account they
+   * do not own. `Keyring.signTransaction` closes the same trap.
+   */
+  'wallet.revealSecretKey': async (ctx, params) => {
+    const vault = await ctx.loadVault(params.password);
+    const meta = vault.accounts.find((a) => a.index === params.accountIndex);
+    if (!meta) {
+      throw new AppError('BAD_REQUEST', `unknown account index ${params.accountIndex}`);
+    }
+    if (meta.source === 'ledger') {
+      throw new AppError('NO_SECRET_KEY', `account ${meta.index} signs on a device`);
+    }
+    const seed = await mnemonicToSeed(vault.mnemonic, vault.bip39Passphrase ?? '');
+    try {
+      const kp = await deriveStellarKeypair(seed, meta.derivationIndex);
+      return {
+        secretKey: kp.secret(),
+        publicKey: kp.publicKey(),
+        path: stellarAccountPath(meta.derivationIndex),
+      };
+    } finally {
+      // Invariant 6: the seed is the one thing here that *can* be erased.
+      zeroize(seed);
+    }
+  },
+
   'wallet.reset': async (ctx) => {
     ctx.keyring.lock();
     ctx.prompts.rejectAll();
+    ctx.ledgerSigns.clear();
     await ctx.autoLock.cancel();
     await clearKeystore();
     // The passkey copy holds the same vault. Leaving it behind would keep a
@@ -1032,45 +1135,7 @@ export const handlers: HandlerMap = {
    */
   'tx.sign': async (ctx, params) => {
     const keyring = ctx.requireUnlocked();
-    await ctx.autoLock.touch();
-    const settings = await ctx.settings();
-    const network = await ctx.network();
-    const index = await ctx.resolveIndex(params.accountIndex);
-    let tx: Transaction;
-    try {
-      const parsed = TransactionBuilder.fromXDR(params.xdr, network.passphrase);
-      if ('innerTransaction' in parsed) {
-        throw new AppError('UNSUPPORTED_OPERATION', 'fee-bump signing is not supported yet');
-      }
-      tx = parsed;
-    } catch (err) {
-      if (err instanceof AppError) throw err;
-      throw new AppError('BAD_REQUEST', 'malformed transaction envelope');
-    }
-    // §4 row 3 (refined): *external* contract calls are a developer-mode
-    // capability, enforced here as well as in the UI, so a tampered popup
-    // cannot reach it either. The one exception is a swap envelope this
-    // background built itself via the aggregator: its hash was allow-listed at
-    // build time and grants exactly one signature (wallet-internal exception).
-    if (isSorobanTransaction(tx) && settings.mode !== 'developer') {
-      const isInternalSwap = ctx.consumeInternalSoroban(tx.hash().toString('hex'));
-      if (!isInternalSwap) {
-        throw new AppError('DEVELOPER_MODE_REQUIRED', 'soroban invocation in beginner mode');
-      }
-    }
-    /**
-     * Second call site (B2). A signature *is* the authorisation, an envelope
-     * built before the first submission went open, or one handed in from
-     * anywhere else, becomes spendable the moment it is signed, and the popup
-     * is not the only thing that can call this. Both the account that signs and
-     * the account the envelope draws its sequence number from are checked; the
-     * envelope in hand is exempt, because signing the very same bytes twice
-     * produces the same transaction, not a second one.
-     */
-    await ctx.assertNoOpenSubmission({
-      accounts: accountsBoundBy(ctx, tx.source, index),
-      envelopeHash: tx.hash().toString('hex'),
-    });
+    const { tx, index } = await authoriseSigning(ctx, params.xdr, params.accountIndex);
     return { signedXdr: await keyring.signTransaction(tx, index) };
   },
 
@@ -1333,6 +1398,19 @@ export const handlers: HandlerMap = {
     } catch {
       throw new AppError('USER_REJECTED');
     }
+    /**
+     * A hardware account cannot sign a page's request in this release.
+     *
+     * Refused *here*, before the prompt, for the same reason the
+     * open-submission check below is: asking a human to approve something the
+     * wallet already knows it will refuse is how confirmation dialogs stop
+     * being read. The dApp gets `LEDGER_REQUIRED`, which is the truthful
+     * answer, and the flow would need the Ledger window — a second window
+     * opening on a page's request is a decision for its own release.
+     */
+    if (keyring.accountMeta(index).source === 'ledger') {
+      throw new AppError('LEDGER_REQUIRED', 'this account signs on a hardware device');
+    }
     const signer = {
       publicKey: keyring.publicKeyOf(index),
       isSelected: index === (await ctx.selectedIndex()),
@@ -1509,4 +1587,141 @@ export const handlers: HandlerMap = {
       mergeSettings(current, { mainnetAcknowledged: true, networkId: 'mainnet' }),
     );
   },
+
+  /* ---------------------------------------------------------- hardware */
+
+  /**
+   * Enrol a Ledger account. Mirrors `account.add`, including the rollback.
+   *
+   * The public key is taken on trust from the caller and that is fine, because
+   * trusting it grants nothing: it is not a key the wallet can sign with, it
+   * is the key every future signature for this slot is *checked against*. A
+   * wrong value here produces an account that can never sign, never one that
+   * signs something the user did not approve.
+   */
+  'ledger.addAccount': async (ctx, params) => {
+    const keyring = ctx.requireUnlocked();
+    const vault = await ctx.loadVault(params.password);
+    const account = keyring.addLedgerAccount({
+      label: params.label,
+      derivationIndex: params.derivationIndex,
+      publicKey: params.publicKey,
+    });
+    try {
+      await ctx.persistVault({ ...vault, accounts: keyring.accountMetas() }, params.password);
+    } catch (err) {
+      // Never leave RAM and storage disagreeing (same rule as account.add).
+      keyring.removeAccount(account.index);
+      throw err;
+    }
+    await ctx.autoLock.touch();
+    return { account };
+  },
+
+  'ledger.beginSign': async (ctx, params) => {
+    const keyring = ctx.requireUnlocked();
+    /**
+     * Resolved and checked *before* `authoriseSigning`, not after.
+     *
+     * Not an error the user can hit through the UI, but the RPC boundary is
+     * reachable from any extension page. Order matters beyond tidiness:
+     * `authoriseSigning` consumes single-use state (the internal-swap hash
+     * grant), so a refusal after it would burn a grant the user then has to
+     * re-earn by re-quoting.
+     */
+    const index = await ctx.resolveIndex(params.accountIndex);
+    const meta = keyring.accountMeta(index);
+    if (meta.source !== 'ledger') {
+      throw new AppError('BAD_REQUEST', `account ${index} does not sign on a device`);
+    }
+    const { tx, network } = await authoriseSigning(ctx, params.xdr, index);
+    /**
+     * Soroban is out of scope for the first hardware release, and saying so
+     * here is the honest option.
+     *
+     * The Stellar app cannot render a contract invocation: signing one means
+     * turning on blind hash signing, at which point the device shows a hash
+     * and the user confirms something neither of us can read. That is the
+     * exact property this wallet refuses elsewhere (§5, and the swap envelope
+     * check), so it is not going to be introduced through the hardware door.
+     */
+    if (isSorobanTransaction(tx)) {
+      throw new AppError(
+        'UNSUPPORTED_OPERATION',
+        'the device cannot display a contract call; hardware signing is limited to classic operations',
+      );
+    }
+    return ctx.ledgerSigns.open({
+      accountIndex: index,
+      derivationIndex: meta.derivationIndex,
+      publicKey: meta.publicKey,
+      // `tx.toXDR()`, not `params.xdr`: the round trip through the SDK is what
+      // guarantees the stored envelope is exactly the one whose signature base
+      // was computed next to it.
+      xdr: tx.toXDR(),
+      networkPassphrase: network.passphrase,
+      signatureBase: tx.signatureBase().toString('base64'),
+    });
+  },
+
+  'ledger.signRequest': async (ctx, params) => {
+    ctx.requireUnlocked();
+    return ctx.ledgerSigns.peek(params.requestId);
+  },
+
+  'ledger.cancelSign': async (ctx, params) => {
+    ctx.ledgerSigns.cancel(params.requestId);
+    return {};
+  },
+
+  /**
+   * Attach the device's answer.
+   *
+   * This is the choke point that makes the courier model safe. Three things
+   * are checked, in this order, and each of them is a real failure mode:
+   *
+   *  1. the request exists and has not been used (single use, so one approval
+   *     can never become two signed envelopes),
+   *  2. the slot is *still* the hardware account it was at `begin`, with the
+   *     same enrolled key — a lock, a reset or an account change mid-ceremony
+   *     must not land a signature on a stale authorisation,
+   *  3. the signature verifies under that key, which `addSignature` does for
+   *     us against the transaction hash.
+   *
+   * Point 3 is why a hostile page cannot do anything useful with this method:
+   * without the device's private key there is no 64-byte value that passes,
+   * and with a *different* device's key the result is `LEDGER_WRONG_DEVICE`
+   * rather than an envelope that fails on chain with `tx_bad_auth`.
+   */
+  'ledger.completeSign': async (ctx, params) => {
+    const keyring = ctx.requireUnlocked();
+    const request = ctx.ledgerSigns.take(params.requestId);
+    const meta = keyring.accountMeta(request.accountIndex);
+    if (meta.source !== 'ledger' || meta.publicKey !== request.publicKey) {
+      throw new AppError('LEDGER_WRONG_DEVICE', 'the account changed while the device was signing');
+    }
+    let tx: Transaction;
+    try {
+      const parsed = TransactionBuilder.fromXDR(request.xdr, request.networkPassphrase);
+      if ('innerTransaction' in parsed) throw new AppError('UNSUPPORTED_OPERATION');
+      tx = parsed;
+    } catch (err) {
+      if (err instanceof AppError) throw err;
+      throw new AppError('INTERNAL_ERROR', 'the stored envelope no longer parses');
+    }
+    try {
+      tx.addSignature(request.publicKey, params.signature);
+    } catch {
+      /**
+       * Deliberately one code for every way this can fail (wrong length,
+       * wrong key, tampered bytes): from here they are the same event — the
+       * thing that came back is not this account's signature over this
+       * envelope — and the SDK's message is not something to hand a user.
+       */
+      throw new AppError('LEDGER_WRONG_DEVICE', 'the signature does not match this account');
+    }
+    await ctx.autoLock.touch();
+    return { signedXdr: tx.toXDR() };
+  },
+
 };

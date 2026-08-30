@@ -37,6 +37,16 @@ export const ERROR_CODES = [
   'KEYSTORE_UNREADABLE',
   'PERMISSION_REQUIRED',
   /**
+   * This account's signing key does not exist in the wallet, so there is
+   * nothing to show. Today that means exactly one thing: a hardware account,
+   * whose key never leaves the device.
+   *
+   * Its own code rather than `BAD_REQUEST`, because it is not a malformed
+   * request: the user asked something reasonable and deserves the actual
+   * reason, which is also the reassuring one.
+   */
+  'NO_SECRET_KEY',
+  /**
    * A passkey ceremony produced material that does not open this wallet.
    *
    * Distinct from `BAD_PASSWORD` and deliberately *not* counted by the unlock
@@ -61,6 +71,31 @@ export const ERROR_CODES = [
    * §6 says no.
    */
   'SUBMIT_OUTCOME_UNKNOWN',
+  /**
+   * The account that has to sign lives on a hardware device, so the keyring
+   * cannot produce the signature.
+   *
+   * Not a failure: it is the *routing* answer. `tx.sign` raises it so no caller
+   * can accidentally treat a hardware account like a seed account, and the UI
+   * turns it into "continue in the Ledger window". The keyring raises it too,
+   * as the belt-and-braces half — a hardware account has no seed key, and the
+   * one thing that must never happen is a signature produced from the wrong
+   * material and reported as this account's.
+   */
+  'LEDGER_REQUIRED',
+  /** No WebHID in this browser (Firefox), or no device the user picked. */
+  'LEDGER_UNAVAILABLE',
+  /**
+   * The device answered for the requested path with a *different* public key
+   * than the enrolled one.
+   *
+   * That is a different Ledger, or the same Ledger with a different BIP-39
+   * passphrase, and either way the signature would be worthless. Caught before
+   * the user is asked to confirm anything.
+   */
+  'LEDGER_WRONG_DEVICE',
+  /** The pending signing request timed out or was already used. */
+  'LEDGER_REQUEST_EXPIRED',
   'INTERNAL_ERROR',
 ] as const;
 

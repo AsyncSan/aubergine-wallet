@@ -166,7 +166,7 @@ Two things worth knowing while comparing the build to the upload:
    (`verifySoroswapEnvelope` in `src/core/stellar/soroswap.ts`, once on
    receipt and again after RPC preparation, because preparation rewrites the
    fee and copies the server's own `auth` entries into the operation).
-2. **`npm test` runs the full suite** (720 unit tests, no network) if you want
+2. **`npm test` runs the full suite** (794 unit tests, no network) if you want
    to see the behaviour the code claims. `npx addons-linter <zip>` reports 0
    errors and 2 warnings. Both warnings are `UNSAFE_VAR_ASSIGNMENT` on
    `innerHTML` inside the bundled React DOM runtime, in its
@@ -177,7 +177,9 @@ Two things worth knowing while comparing the build to the upload:
 ### First steps on the test network
 
 1. Open the popup, choose **Create a new wallet**, set a password
-2. Write the recovery phrase down and answer the verification question
+2. Write the recovery phrase down and answer the verification question. If you
+   would rather have a file than a piece of paper, the phrase screen will save
+   one for you — see the note on it under *Security model*
 3. On the overview, click **Get test balance** (friendbot)
 4. The balance arrives after a few seconds and **Send** works from then on
 
@@ -197,7 +199,7 @@ of a source archive.
 
 ```bash
 npx tsc --noEmit    # TypeScript 5 strict
-npm test            # Vitest, 720 unit tests across 38 files
+npm test            # Vitest, 794 unit tests across 43 files
 npm run test:e2e    # Playwright against the built Chrome artifact
 npm run test:testnet # integration run against the real test network
 npm run test:mainnet # read-only integration run against the main network
@@ -233,10 +235,12 @@ chain, and they need to be started deliberately.
 
 The seven invariants from `ARCHITECTURE.md` §3 are binding:
 
-1. A decrypted seed or secret key never leaves the background context. The one
-   deliberate exception is `wallet.revealRecoveryPhrase`, which is user
-   initiated, requires the password again, and decrypts the vault freshly
-   rather than holding the phrase in memory.
+1. A decrypted seed or secret key never leaves the background context. There
+   are two deliberate exceptions, `wallet.revealRecoveryPhrase` and
+   `wallet.revealSecretKey`; both are user initiated, require the password
+   again, and decrypt the vault freshly rather than reading the live keyring,
+   so an unlocked popup left on a desk still gives nothing away. See *Getting
+   your keys out* below.
 2. `chrome.storage.local` holds only the ciphertext blob `{v,kdf,params,salt,iv,ct}`
    plus non-sensitive settings. In keystore v2 the KDF header is bound into the
    ciphertext as AES-GCM `additionalData`, so a downgraded cost parameter fails
@@ -253,6 +257,41 @@ Key derivation is Argon2id at 64 MiB over 3 passes, with PBKDF2-SHA-512 at
 AES-256-GCM. Unlocking is throttled after four failed attempts, growing
 exponentially to a 30 minute ceiling, and the counter survives a browser
 restart.
+
+### Getting your keys out
+
+Self-custody that only works inside one extension is not self-custody, so both
+exports exist and neither is hidden. They are not the same thing, and the
+difference is the point: the recovery phrase is the whole wallet, forever,
+including every account added later, while `wallet.revealSecretKey` hands over
+one account's SEP-0005 key in strkey form (`S…`) and nothing else. Anyone moving
+a single account into another Stellar tool should use the narrow one — a wallet
+that refuses to offer it does not stop the user, it only makes the phrase the
+thing they paste into a stranger's website.
+
+Both are gated the same way: the password every single time, even while the
+wallet is unlocked, the vault decrypted from scratch rather than read out of the
+running keyring, and a 60 second auto-hide, because a key on a screen is a key
+anyone walking past can photograph. A hardware account is refused rather than
+answered (`NO_SECRET_KEY`): the seed would happily derive a key for the same
+path, and it would be a different key than the one on the device, so answering
+would mean telling the user "this is your account's key" about an account they
+do not control.
+
+The optional `.txt` backup on the phrase screen is the one place the wallet
+helps you put a plaintext recovery phrase on a disk, and it is offered with open
+eyes: in practice the alternative to a file is rarely paper, it is a screenshot
+in a photo library that syncs. What the wallet controls, it does. Writing the
+file takes two separate clicks, the first of which only opens the warning. The
+name is sixteen random consonants and digits with no prefix, date or counter,
+because a name is metadata that travels everywhere the file goes and
+`recovery-phrase.txt` in a downloads folder on a shared screen is a signpost to
+the money; the screen names the file before and after saving, since a name that
+gives nothing away also gives you nothing to search for. The file itself does
+say what it is, on purpose — twelve BIP-39 words are recognisable to anyone who
+would exploit them, so the label only costs the honest finder — and it carries
+its own warnings. No `downloads` permission is involved: it is a blob URL and an
+`<a download>`, so nothing about this feature appears in the install prompt.
 
 The password that protects the vault is gated on strength, not only on length.
 An 8-character floor alone does not survive an offline grind of a stolen
@@ -376,15 +415,23 @@ Not included at all:
 
 - No fiat on-ramp. The Buy button exists, the route through regulated anchor
   partners does not.
-- No hardware wallet, no WalletConnect, no passkey sign-in
+- No WalletConnect.
 - No multisig execution. Signers are displayed, co-signing is not possible.
 - No mobile app
 
 Present but unfinished:
 
-- Soroban call arguments are not decoded into plain language. The dialog says
-  "smart contract call", not what is being called. Swaps through Soroswap are
-  the exception, because those are checked against the quote.
+- Hardware wallet support is Ledger only, Chrome only, and classic operations
+  only. Firefox has no WebHID and has declined to implement it, so the button
+  is not offered there. Contract calls are refused rather than signed blind:
+  the Stellar app cannot render an invocation, and signing one would mean
+  confirming a bare hash on the device. **Not yet tested against physical
+  hardware** — the flow is covered by unit tests through a fake device that
+  produces real ed25519 signatures, which verifies every step except the
+  device itself.
+- A Ledger account cannot answer a signature request from a web page. The
+  connector returns `LEDGER_REQUIRED` instead of opening a second window on a
+  page's request.
 - The curated asset list is a placeholder. The criteria for what belongs on it,
   and who decides, are open, and the issuer addresses have not been checked
   against the live network.
